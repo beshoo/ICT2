@@ -245,11 +245,19 @@ double GetLowestPositionPrice(int posType)
 //+------------------------------------------------------------------+
 bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
 {
+   // Don't even attempt if trading is globally disabled or EA is stopping
+   if(IsStopped()) return false;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return false;
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))           return false;
+
    price = NormalizePrice(price);
    bool result = false;
 
    for(int retry = 0; retry <= 2; retry++)
    {
+      // Abort retry loop if EA is being stopped
+      if(IsStopped()) return false;
+
       if(orderType == ORDER_TYPE_BUY_STOP)
          result = trade.BuyStop(lots, price, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "GridEA BuyStop");
       else if(orderType == ORDER_TYPE_SELL_STOP)
@@ -262,7 +270,15 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
             trade.ResultRetcodeDescription(), " Price=", price,
             " Type=", EnumToString(orderType));
 
-      // Handle specific errors
+      // Non-retryable: trading disabled by client or server
+      if(error == TRADE_RETCODE_CLIENT_DISABLES_AT ||
+         error == TRADE_RETCODE_SERVER_DISABLES_AT)
+      {
+         Print("PlacePendingOrder: AutoTrading is disabled — not retrying.");
+         return false;
+      }
+
+      // Handle specific retryable errors
       if(error == TRADE_RETCODE_INVALID_STOPS || error == TRADE_RETCODE_INVALID_PRICE)
       {
          double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -436,6 +452,18 @@ double CalculateSessionLotSize()
 //+------------------------------------------------------------------+
 void InitializeGrid()
 {
+   // Abort immediately if trading is disabled or EA is stopping
+   if(IsStopped())
+   {
+      Print("InitializeGrid: EA is stopping — aborting.");
+      return;
+   }
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+   {
+      Print("InitializeGrid: AutoTrading is disabled — aborting. Enable AutoTrading and restart.");
+      return;
+   }
+
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
@@ -451,9 +479,14 @@ void InitializeGrid()
          " Lot=", g_sessionLotSize,
          " Spread=", spreadPoints, " pts");
 
+   int buyPlaced  = 0;
+   int sellPlaced = 0;
+
    // 3. Place Buy Stop orders ABOVE anchor
    for(int i = 1; i <= GridOrders; i++)
    {
+      if(IsStopped()) break;
+
       double price = NormalizePrice(g_anchorPrice + halfSpread + (i * GridSpacingPoints * g_point));
 
       // Ensure at least stopLevel above Ask
@@ -461,12 +494,15 @@ void InitializeGrid()
       if(price <= minBuyStop)
          price = NormalizePrice(minBuyStop + g_point);
 
-      PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, g_sessionLotSize);
+      if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, g_sessionLotSize))
+         buyPlaced++;
    }
 
    // 4. Place Sell Stop orders BELOW anchor
    for(int i = 1; i <= GridOrders; i++)
    {
+      if(IsStopped()) break;
+
       double price = NormalizePrice(g_anchorPrice - halfSpread - (i * GridSpacingPoints * g_point));
 
       // Ensure at least stopLevel below Bid
@@ -474,13 +510,22 @@ void InitializeGrid()
       if(price >= minSellStop)
          price = NormalizePrice(minSellStop - g_point);
 
-      PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, g_sessionLotSize);
+      if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, g_sessionLotSize))
+         sellPlaced++;
    }
 
-   g_gridInitialized = true;
-   Print("=== GRID INITIALIZED === Anchor=", g_anchorPrice,
-         " Lot=", g_sessionLotSize,
-         " Orders/side=", GridOrders);
+   // Only declare initialized if at least 1 order was placed on each side
+   if(buyPlaced > 0 || sellPlaced > 0)
+   {
+      g_gridInitialized = true;
+      Print("=== GRID INITIALIZED === Anchor=", g_anchorPrice,
+            " Lot=", g_sessionLotSize,
+            " BuyStops=", buyPlaced, " SellStops=", sellPlaced);
+   }
+   else
+   {
+      Print("InitializeGrid: No orders placed (trading disabled?) — grid NOT initialized.");
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -489,6 +534,15 @@ void InitializeGrid()
 void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrders[],
                              int buyStopCount, int sellStopCount)
 {
+   // Skip entirely if trading is disabled or EA is stopping
+   if(IsStopped()) return;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))           return;
+
+   // Rate-limit: place at most this many new orders per tick to avoid
+   // log spam and CPU overload when many orders activate simultaneously.
+   const int MAX_REPLENISH_PER_TICK = 5;
+
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
@@ -505,12 +559,20 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
       if(highestBuyStop <= 0.0)
          highestBuyStop = ask + g_stopLevel * g_point;
 
-      for(int i = 1; i <= missingBuys; i++)
+      int placed = 0;
+      for(int i = 1; i <= missingBuys && placed < MAX_REPLENISH_PER_TICK; i++)
       {
+         if(IsStopped()) return;
          double newPrice = NormalizePrice(highestBuyStop + (i * GridSpacingPoints * g_point));
          if(newPrice > ask + g_stopLevel * g_point)
-            PlacePendingOrder(ORDER_TYPE_BUY_STOP, newPrice, g_sessionLotSize);
+         {
+            if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, newPrice, g_sessionLotSize))
+               placed++;
+         }
       }
+      if(missingBuys > MAX_REPLENISH_PER_TICK)
+         Print("ReplenishPendingOrders: ", missingBuys, " buy stops missing, placed ",
+               placed, " this tick (rate-limited).");
    }
 
    // --- Replenish Sell Stops ---
@@ -526,12 +588,20 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
       if(lowestSellStop == DBL_MAX || lowestSellStop <= 0.0)
          lowestSellStop = bid - g_stopLevel * g_point;
 
-      for(int i = 1; i <= missingSells; i++)
+      int placed = 0;
+      for(int i = 1; i <= missingSells && placed < MAX_REPLENISH_PER_TICK; i++)
       {
+         if(IsStopped()) return;
          double newPrice = NormalizePrice(lowestSellStop - (i * GridSpacingPoints * g_point));
          if(newPrice < bid - g_stopLevel * g_point)
-            PlacePendingOrder(ORDER_TYPE_SELL_STOP, newPrice, g_sessionLotSize);
+         {
+            if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, newPrice, g_sessionLotSize))
+               placed++;
+         }
       }
+      if(missingSells > MAX_REPLENISH_PER_TICK)
+         Print("ReplenishPendingOrders: ", missingSells, " sell stops missing, placed ",
+               placed, " this tick (rate-limited).");
    }
 }
 
@@ -995,6 +1065,9 @@ int OnInit()
 void OnTick()
 {
    if(!g_gridInitialized) return;
+
+   // Skip all trading logic when AutoTrading is disabled
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
 
    // --- Collect positions and pending orders ---
    SOrderInfo buyPositions[], sellPositions[];
