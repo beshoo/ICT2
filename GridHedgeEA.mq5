@@ -58,6 +58,19 @@ struct SOrderInfo
 };
 
 //+------------------------------------------------------------------+
+//| UTILITY: Normalize price to valid tick size multiple              |
+//| NormalizeDouble only ensures decimal places — this also ensures   |
+//| the price is a valid multiple of SYMBOL_TRADE_TICK_SIZE.          |
+//| Essential for Gold/XAU where tickSize=0.01 but digits=3.         |
+//+------------------------------------------------------------------+
+double NormalizePrice(double price)
+{
+   if(g_tickSize > 0.0)
+      price = MathRound(price / g_tickSize) * g_tickSize;
+   return NormalizeDouble(price, g_digits);
+}
+
+//+------------------------------------------------------------------+
 //| UTILITY: Sort array of SOrderInfo by price ascending (bubble)    |
 //+------------------------------------------------------------------+
 void SortByPriceAscending(SOrderInfo &arr[])
@@ -232,7 +245,7 @@ double GetLowestPositionPrice(int posType)
 //+------------------------------------------------------------------+
 bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
 {
-   price = NormalizeDouble(price, g_digits);
+   price = NormalizePrice(price);
    bool result = false;
 
    for(int retry = 0; retry <= 2; retry++)
@@ -255,9 +268,9 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
          double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
          if(orderType == ORDER_TYPE_BUY_STOP)
-            price = NormalizeDouble(ask + (g_stopLevel + 5) * g_point, g_digits);
+            price = NormalizePrice(ask + (g_stopLevel + 5) * g_point);
          else
-            price = NormalizeDouble(bid - (g_stopLevel + 5) * g_point, g_digits);
+            price = NormalizePrice(bid - (g_stopLevel + 5) * g_point);
       }
       else if(error == TRADE_RETCODE_NO_MONEY)
       {
@@ -297,7 +310,7 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
 //+------------------------------------------------------------------+
 bool ModifyPendingOrder(ulong ticket, double newPrice)
 {
-   newPrice = NormalizeDouble(newPrice, g_digits);
+   newPrice = NormalizePrice(newPrice);
 
    for(int retry = 0; retry <= 2; retry++)
    {
@@ -426,8 +439,8 @@ void InitializeGrid()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   // 1. Anchor price = midpoint, fixed for the cycle
-   g_anchorPrice    = NormalizeDouble((ask + bid) / 2.0, g_digits);
+   // 1. Anchor price = midpoint, fixed for the cycle (tick-aligned)
+   g_anchorPrice    = NormalizePrice((ask + bid) / 2.0);
    g_sessionLotSize = CalculateSessionLotSize();
 
    // 2. Current spread
@@ -441,13 +454,12 @@ void InitializeGrid()
    // 3. Place Buy Stop orders ABOVE anchor
    for(int i = 1; i <= GridOrders; i++)
    {
-      double price = g_anchorPrice + halfSpread + (i * GridSpacingPoints * g_point);
-      price = NormalizeDouble(price, g_digits);
+      double price = NormalizePrice(g_anchorPrice + halfSpread + (i * GridSpacingPoints * g_point));
 
       // Ensure at least stopLevel above Ask
       double minBuyStop = ask + g_stopLevel * g_point;
       if(price <= minBuyStop)
-         price = NormalizeDouble(minBuyStop + g_point, g_digits);
+         price = NormalizePrice(minBuyStop + g_point);
 
       PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, g_sessionLotSize);
    }
@@ -455,13 +467,12 @@ void InitializeGrid()
    // 4. Place Sell Stop orders BELOW anchor
    for(int i = 1; i <= GridOrders; i++)
    {
-      double price = g_anchorPrice - halfSpread - (i * GridSpacingPoints * g_point);
-      price = NormalizeDouble(price, g_digits);
+      double price = NormalizePrice(g_anchorPrice - halfSpread - (i * GridSpacingPoints * g_point));
 
       // Ensure at least stopLevel below Bid
       double minSellStop = bid - g_stopLevel * g_point;
       if(price >= minSellStop)
-         price = NormalizeDouble(minSellStop - g_point, g_digits);
+         price = NormalizePrice(minSellStop - g_point);
 
       PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, g_sessionLotSize);
    }
@@ -496,7 +507,7 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
 
       for(int i = 1; i <= missingBuys; i++)
       {
-         double newPrice = NormalizeDouble(highestBuyStop + (i * GridSpacingPoints * g_point), g_digits);
+         double newPrice = NormalizePrice(highestBuyStop + (i * GridSpacingPoints * g_point));
          if(newPrice > ask + g_stopLevel * g_point)
             PlacePendingOrder(ORDER_TYPE_BUY_STOP, newPrice, g_sessionLotSize);
       }
@@ -517,7 +528,7 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
 
       for(int i = 1; i <= missingSells; i++)
       {
-         double newPrice = NormalizeDouble(lowestSellStop - (i * GridSpacingPoints * g_point), g_digits);
+         double newPrice = NormalizePrice(lowestSellStop - (i * GridSpacingPoints * g_point));
          if(newPrice < bid - g_stopLevel * g_point)
             PlacePendingOrder(ORDER_TYPE_SELL_STOP, newPrice, g_sessionLotSize);
       }
@@ -716,7 +727,7 @@ void MigrateToFillGaps(int direction,
 
       for(int i = 0; i < ordersToMove; i++)
       {
-         double targetPrice = NormalizeDouble(gapTop - ((i + 1) * GridSpacingPoints * g_point), g_digits);
+         double targetPrice = NormalizePrice(gapTop - ((i + 1) * GridSpacingPoints * g_point));
 
          if(targetPrice < bid - g_stopLevel * g_point)
          {
@@ -748,7 +759,7 @@ void MigrateToFillGaps(int direction,
       for(int i = 0; i < ordersToMove; i++)
       {
          int    idx         = buyStopCount - 1 - i;  // start from highest buy stop
-         double targetPrice = NormalizeDouble(gapBottom + ((i + 1) * GridSpacingPoints * g_point), g_digits);
+         double targetPrice = NormalizePrice(gapBottom + ((i + 1) * GridSpacingPoints * g_point));
 
          if(targetPrice > ask + g_stopLevel * g_point)
          {
@@ -878,6 +889,12 @@ int OnInit()
    g_stopLevel   = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
    g_freezeLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
 
+   Print("GridHedgeEA: Symbol=", _Symbol,
+         " Point=", g_point,
+         " Digits=", g_digits,
+         " TickSize=", g_tickSize,
+         " StopLevel=", g_stopLevel);
+
    // 2. Set up CTrade
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(10);
@@ -957,10 +974,10 @@ int OnInit()
       double highestBuyStop = (ArraySize(buyStops)  > 0) ? buyStops[ArraySize(buyStops)-1].price : 0.0;
 
       if(lowestSellStop > 0.0 && highestBuyStop > 0.0)
-         g_anchorPrice = NormalizeDouble((lowestSellStop + highestBuyStop) / 2.0, g_digits);
+         g_anchorPrice = NormalizePrice((lowestSellStop + highestBuyStop) / 2.0);
       else
-         g_anchorPrice = NormalizeDouble((SymbolInfoDouble(_Symbol, SYMBOL_ASK) +
-                                          SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2.0, g_digits);
+         g_anchorPrice = NormalizePrice((SymbolInfoDouble(_Symbol, SYMBOL_ASK) +
+                                         SymbolInfoDouble(_Symbol, SYMBOL_BID)) / 2.0);
 
       Print("GridHedgeEA: Recovered — Anchor≈", g_anchorPrice, " Lot=", g_sessionLotSize);
    }
