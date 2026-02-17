@@ -26,6 +26,9 @@ input bool     EnableMigration    = true;    // Enable/disable gap-filling migra
 #define DIRECTION_UP   1
 #define DIRECTION_DOWN 2
 
+//=== UI Constants ===
+#define BTN_CLOSE_ALL  "GridEA_CloseAll"
+
 //=== Global Objects ===
 CTrade         trade;
 CPositionInfo  posInfo;
@@ -249,14 +252,16 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
    if(IsStopped()) return false;
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return false;
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))           return false;
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))     return false;
 
    price = NormalizePrice(price);
    bool result = false;
 
    for(int retry = 0; retry <= 2; retry++)
    {
-      // Abort retry loop if EA is being stopped
+      // Abort retry loop if EA is being stopped or connection lost
       if(IsStopped()) return false;
+      if(!TerminalInfoInteger(TERMINAL_CONNECTED)) return false;
 
       // Validate price against FRESH market data before sending
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -288,11 +293,17 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
             " Ask=", ask, " Bid=", bid, " Spread=", spread,
             " Type=", EnumToString(orderType));
 
-      // Non-retryable: trading disabled by client or server
+      // Non-retryable: trading disabled or no connection
       if(error == TRADE_RETCODE_CLIENT_DISABLES_AT ||
          error == TRADE_RETCODE_SERVER_DISABLES_AT)
       {
          Print("PlacePendingOrder: AutoTrading is disabled — not retrying.");
+         return false;
+      }
+      if(error == TRADE_RETCODE_CONNECTION || error == TRADE_RETCODE_ERROR ||
+         !TerminalInfoInteger(TERMINAL_CONNECTED))
+      {
+         Print("PlacePendingOrder: No connection — not retrying.");
          return false;
       }
 
@@ -504,40 +515,31 @@ void InitializeGrid()
    int buyPlaced  = 0;
    int sellPlaced = 0;
 
-   // 3. Place Buy Stop orders ABOVE anchor
+   // 3. INTERLEAVED placement: alternate 1 Buy Stop + 1 Sell Stop per iteration
+   //    This builds both sides simultaneously so fewer orders activate during placement.
    for(int i = 1; i <= GridOrders; i++)
    {
       if(IsStopped()) break;
 
-      ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);   // refresh each iteration
-
-      double price = NormalizePrice(g_anchorPrice + halfSpread + (i * GridSpacingPoints * g_point));
-
-      // Ensure price is strictly above current Ask
-      if(price <= ask)
-         price = NormalizePrice(ask + MathMax(g_stopLevel, 1) * g_point);
-
-      if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, g_sessionLotSize))
+      // --- Place Buy Stop i ---
+      ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double buyPrice = NormalizePrice(g_anchorPrice + halfSpread + (i * GridSpacingPoints * g_point));
+      if(buyPrice <= ask)
+         buyPrice = NormalizePrice(ask + MathMax(g_stopLevel, 1) * g_point);
+      if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, buyPrice, g_sessionLotSize))
          buyPlaced++;
-   }
 
-   // 4. Place Sell Stop orders BELOW anchor
-   //    Refresh Bid before each order — placing 100 buy stops above takes minutes,
-   //    during which the market moves. Stale prices cause "invalid price" errors.
-   for(int i = 1; i <= GridOrders; i++)
-   {
       if(IsStopped()) break;
 
-      bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);   // refresh each iteration
-
-      double price = NormalizePrice(g_anchorPrice - halfSpread - (i * GridSpacingPoints * g_point));
-
-      // Ensure price is strictly below current Bid (with safety margin for spread)
-      double minSellStop = bid - MathMax(g_stopLevel, (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD)) * g_point;
-      if(price >= bid)
-         price = NormalizePrice(minSellStop - g_point);
-
-      if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, g_sessionLotSize))
+      // --- Place Sell Stop i ---
+      bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double sellPrice = NormalizePrice(g_anchorPrice - halfSpread - (i * GridSpacingPoints * g_point));
+      if(sellPrice >= bid)
+      {
+         int curSpread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+         sellPrice = NormalizePrice(bid - MathMax(g_stopLevel, curSpread) * g_point - g_point);
+      }
+      if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, sellPrice, g_sessionLotSize))
          sellPlaced++;
    }
 
@@ -941,33 +943,142 @@ void ExecuteFullClose(SOrderInfo &buyPositions[], SOrderInfo &sellPositions[],
 void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStopCount,
                      double totalProfit, double targetProfit)
 {
-   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
-   double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
-   double progress = (targetProfit > 0.0) ? (totalProfit / targetProfit * 100.0) : 0.0;
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double marginUsed = AccountInfoDouble(ACCOUNT_MARGIN);
+   double marginLvl  = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   double progress   = (targetProfit > 0.0) ? (totalProfit / targetProfit * 100.0) : 0.0;
+
+   int spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   bool connected = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+
+   // Count winning/losing positions and their totals
+   int winCount = 0, loseCount = 0;
+   double winTotal = 0.0, loseTotal = 0.0;
+   int totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL)  != _Symbol)    continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != MagicNumber) continue;
+      double pnl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      if(pnl >= 0.0)  { winCount++;  winTotal  += pnl; }
+      else             { loseCount++; loseTotal += pnl; }
+   }
 
    string info = "";
-   info += "╔══════════════════════════════════╗\n";
-   info += "║     GRID HEDGE EA v2.0           ║\n";
-   info += "╠══════════════════════════════════╣\n";
-   info += "║ Anchor Price:  " + DoubleToString(g_anchorPrice,    g_digits) + "\n";
-   info += "║ Session Lot:   " + DoubleToString(g_sessionLotSize, 2)        + "\n";
-   info += "║ Grid Spacing:  " + IntegerToString((int)GridSpacingPoints)    + " points\n";
-   info += "╠══════════════════════════════════╣\n";
-   info += "║ BUY Positions:   " + IntegerToString(buyCount)     + "\n";
-   info += "║ SELL Positions:  " + IntegerToString(sellCount)    + "\n";
-   info += "║ Buy Stops:       " + IntegerToString(buyStopCount)  + "\n";
-   info += "║ Sell Stops:      " + IntegerToString(sellStopCount) + "\n";
-   info += "╠══════════════════════════════════╣\n";
-   info += "║ Floating P/L:  $" + DoubleToString(totalProfit,  2) + "\n";
-   info += "║ Target (" + DoubleToString(TotalProfitPercent, 1) + "%): $" + DoubleToString(targetProfit, 2) + "\n";
-   info += "║ Progress:      "  + DoubleToString(progress, 1)    + "%\n";
-   info += "╠══════════════════════════════════╣\n";
-   info += "║ Balance: $" + DoubleToString(balance, 2) + "\n";
-   info += "║ Equity:  $" + DoubleToString(equity,  2) + "\n";
-   info += "║ Migration: " + (EnableMigration ? "ON" : "OFF") + "\n";
-   info += "╚══════════════════════════════════╝\n";
+   info += "========================================\n";
+   info += "       GRID HEDGE EA v2.0\n";
+   info += "========================================\n";
+   info += " Anchor:     " + DoubleToString(g_anchorPrice, g_digits) + "\n";
+   info += " Session Lot: " + DoubleToString(g_sessionLotSize, 2) + "\n";
+   info += " Spacing:    " + IntegerToString((int)GridSpacingPoints) + " pts\n";
+   info += "----------------------------------------\n";
+   info += " POSITIONS\n";
+   info += "   BUY:  " + IntegerToString(buyCount) + "    SELL: " + IntegerToString(sellCount) + "\n";
+   info += "   Total: " + IntegerToString(buyCount + sellCount) + "\n";
+   info += " PENDING\n";
+   info += "   Buy Stops:  " + IntegerToString(buyStopCount) + " / " + IntegerToString(GridOrders) + "\n";
+   info += "   Sell Stops: " + IntegerToString(sellStopCount) + " / " + IntegerToString(GridOrders) + "\n";
+   info += "----------------------------------------\n";
+   info += " TRADE STATS\n";
+   info += "   Winning:  " + IntegerToString(winCount) + "  ($" + DoubleToString(winTotal, 2) + ")\n";
+   info += "   Losing:   " + IntegerToString(loseCount) + "  ($" + DoubleToString(loseTotal, 2) + ")\n";
+   info += "   Net P/L:  $" + DoubleToString(totalProfit, 2) + "\n";
+   info += "----------------------------------------\n";
+   info += " PROFIT TARGET\n";
+   info += "   Target (" + DoubleToString(TotalProfitPercent, 1) + "%): $" + DoubleToString(targetProfit, 2) + "\n";
+   info += "   Progress:    " + DoubleToString(progress, 1) + "%\n";
+   info += "----------------------------------------\n";
+   info += " ACCOUNT\n";
+   info += "   Balance:     $" + DoubleToString(balance, 2) + "\n";
+   info += "   Equity:      $" + DoubleToString(equity, 2) + "\n";
+   info += "   Free Margin: $" + DoubleToString(freeMargin, 2) + "\n";
+   info += "   Margin Used: $" + DoubleToString(marginUsed, 2) + "\n";
+   info += "   Margin Lvl:  " + (marginUsed > 0 ? DoubleToString(marginLvl, 1) + "%" : "---") + "\n";
+   info += "----------------------------------------\n";
+   info += " MARKET\n";
+   info += "   Bid: " + DoubleToString(bid, g_digits) + "  Ask: " + DoubleToString(ask, g_digits) + "\n";
+   info += "   Spread: " + IntegerToString(spread) + " pts\n";
+   info += "   Migration: " + (EnableMigration ? "ON" : "OFF") + "\n";
+   info += "   Connection: " + (connected ? "OK" : "LOST") + "\n";
+   info += "========================================\n";
 
    Comment(info);
+}
+
+//+------------------------------------------------------------------+
+//| UI: Create the Close All button on the chart                      |
+//+------------------------------------------------------------------+
+void CreateCloseAllButton()
+{
+   long chartID = ChartID();
+   // Delete if it already exists (e.g., on re-init)
+   ObjectDelete(chartID, BTN_CLOSE_ALL);
+
+   ObjectCreate(chartID, BTN_CLOSE_ALL, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_CORNER,    CORNER_LEFT_LOWER);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_YDISTANCE, 50);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_XSIZE,     180);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_YSIZE,     35);
+   ObjectSetString(chartID,  BTN_CLOSE_ALL, OBJPROP_TEXT,       "CLOSE ALL & EXIT");
+   ObjectSetString(chartID,  BTN_CLOSE_ALL, OBJPROP_FONT,      "Arial Bold");
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_FONTSIZE,   10);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_COLOR,      clrWhite);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_BGCOLOR,    clrRed);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_BORDER_COLOR, clrDarkRed);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_STATE,      false);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(chartID, BTN_CLOSE_ALL, OBJPROP_ZORDER,     100);
+   ChartRedraw(chartID);
+}
+
+//+------------------------------------------------------------------+
+//| UI: Remove the Close All button from the chart                    |
+//+------------------------------------------------------------------+
+void DestroyCloseAllButton()
+{
+   ObjectDelete(ChartID(), BTN_CLOSE_ALL);
+}
+
+//+------------------------------------------------------------------+
+//| ACTION: Close everything and shut down the EA                     |
+//+------------------------------------------------------------------+
+void CloseAllAndExit()
+{
+   Print("=== CLOSE ALL & EXIT === User requested full shutdown.");
+
+   // 1. Delete all pending orders
+   DeleteAllPendingOrders();
+   Sleep(500);
+
+   // 2. Close via CloseBy where possible (saves spread)
+   SOrderInfo allBuys[], allSells[];
+   CollectAndSortPositions(allBuys, allSells);
+   int pairs = MathMin(ArraySize(allBuys), ArraySize(allSells));
+   for(int i = 0; i < pairs; i++)
+   {
+      trade.PositionCloseBy(allBuys[i].ticket, allSells[i].ticket);
+      Sleep(200);
+   }
+
+   // 3. Close any remaining positions normally
+   CloseAllRemainingPositions();
+
+   // 4. Reset EA state
+   g_gridInitialized = false;
+   g_anchorPrice     = 0.0;
+   g_sessionLotSize  = 0.0;
+
+   Print("=== ALL CLOSED === EA shutdown complete.");
+
+   // 5. Remove EA from chart
+   ExpertRemove();
 }
 
 //+------------------------------------------------------------------+
@@ -1096,6 +1207,9 @@ int OnInit()
       InitializeGrid();
    }
 
+   // 5. Create the Close All button on the chart
+   CreateCloseAllButton();
+
    return INIT_SUCCEEDED;
 }
 
@@ -1106,8 +1220,9 @@ void OnTick()
 {
    if(!g_gridInitialized) return;
 
-   // Skip all trading logic when AutoTrading is disabled
+   // Skip all trading logic when AutoTrading is disabled or no connection
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED)) return;
 
    // --- Collect positions and pending orders ---
    SOrderInfo buyPositions[], sellPositions[];
@@ -1188,8 +1303,24 @@ void OnTick()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   DestroyCloseAllButton();
    Comment("");  // Clear chart display
    Print("GridHedgeEA removed. Reason: ", reason,
          " — positions and orders preserved for restart.");
+}
+
+//+------------------------------------------------------------------+
+//| CHART EVENT: Handle button clicks                                 |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == BTN_CLOSE_ALL)
+   {
+      // Reset button visual state so it doesn't stay pressed
+      ObjectSetInteger(ChartID(), BTN_CLOSE_ALL, OBJPROP_STATE, false);
+      ChartRedraw(ChartID());
+
+      CloseAllAndExit();
+   }
 }
 //+------------------------------------------------------------------+
