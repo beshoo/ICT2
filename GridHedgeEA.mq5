@@ -258,6 +258,23 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
       // Abort retry loop if EA is being stopped
       if(IsStopped()) return false;
 
+      // Validate price against FRESH market data before sending
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      int spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+
+      // Use effective stop level: at least the spread to avoid "too close" rejections
+      int effectiveStopPts = MathMax(g_stopLevel, spread);
+
+      if(orderType == ORDER_TYPE_BUY_STOP && price <= ask)
+      {
+         price = NormalizePrice(ask + effectiveStopPts * g_point);
+      }
+      else if(orderType == ORDER_TYPE_SELL_STOP && price >= bid)
+      {
+         price = NormalizePrice(bid - effectiveStopPts * g_point);
+      }
+
       if(orderType == ORDER_TYPE_BUY_STOP)
          result = trade.BuyStop(lots, price, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "GridEA BuyStop");
       else if(orderType == ORDER_TYPE_SELL_STOP)
@@ -268,6 +285,7 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
       uint error = trade.ResultRetcode();
       Print("PlacePendingOrder failed [attempt ", retry+1, "]: ",
             trade.ResultRetcodeDescription(), " Price=", price,
+            " Ask=", ask, " Bid=", bid, " Spread=", spread,
             " Type=", EnumToString(orderType));
 
       // Non-retryable: trading disabled by client or server
@@ -281,12 +299,16 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
       // Handle specific retryable errors
       if(error == TRADE_RETCODE_INVALID_STOPS || error == TRADE_RETCODE_INVALID_PRICE)
       {
-         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         // Refresh prices and place further from market (use spread as safe distance)
+         ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+         effectiveStopPts = MathMax(g_stopLevel, spread) + 10;
+
          if(orderType == ORDER_TYPE_BUY_STOP)
-            price = NormalizePrice(ask + (g_stopLevel + 5) * g_point);
+            price = NormalizePrice(ask + effectiveStopPts * g_point);
          else
-            price = NormalizePrice(bid - (g_stopLevel + 5) * g_point);
+            price = NormalizePrice(bid - effectiveStopPts * g_point);
       }
       else if(error == TRADE_RETCODE_NO_MONEY)
       {
@@ -487,27 +509,32 @@ void InitializeGrid()
    {
       if(IsStopped()) break;
 
+      ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);   // refresh each iteration
+
       double price = NormalizePrice(g_anchorPrice + halfSpread + (i * GridSpacingPoints * g_point));
 
-      // Ensure at least stopLevel above Ask
-      double minBuyStop = ask + g_stopLevel * g_point;
-      if(price <= minBuyStop)
-         price = NormalizePrice(minBuyStop + g_point);
+      // Ensure price is strictly above current Ask
+      if(price <= ask)
+         price = NormalizePrice(ask + MathMax(g_stopLevel, 1) * g_point);
 
       if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, g_sessionLotSize))
          buyPlaced++;
    }
 
    // 4. Place Sell Stop orders BELOW anchor
+   //    Refresh Bid before each order — placing 100 buy stops above takes minutes,
+   //    during which the market moves. Stale prices cause "invalid price" errors.
    for(int i = 1; i <= GridOrders; i++)
    {
       if(IsStopped()) break;
 
+      bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);   // refresh each iteration
+
       double price = NormalizePrice(g_anchorPrice - halfSpread - (i * GridSpacingPoints * g_point));
 
-      // Ensure at least stopLevel below Bid
-      double minSellStop = bid - g_stopLevel * g_point;
-      if(price >= minSellStop)
+      // Ensure price is strictly below current Bid (with safety margin for spread)
+      double minSellStop = bid - MathMax(g_stopLevel, (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD)) * g_point;
+      if(price >= bid)
          price = NormalizePrice(minSellStop - g_point);
 
       if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, g_sessionLotSize))
@@ -963,12 +990,25 @@ int OnInit()
          " Point=", g_point,
          " Digits=", g_digits,
          " TickSize=", g_tickSize,
-         " StopLevel=", g_stopLevel);
+         " StopLevel=", g_stopLevel,
+         " FreezeLevel=", g_freezeLevel);
 
    // 2. Set up CTrade
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(10);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
+
+   // Auto-detect the correct filling mode from symbol properties
+   int fillingMode = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((fillingMode & SYMBOL_FILLING_FOK) != 0)
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+   else if((fillingMode & SYMBOL_FILLING_IOC) != 0)
+      trade.SetTypeFilling(ORDER_FILLING_IOC);
+   else
+      trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
+   Print("GridHedgeEA: FillingMode=", fillingMode,
+         " Using=", ((fillingMode & SYMBOL_FILLING_FOK) != 0) ? "FOK" :
+                     ((fillingMode & SYMBOL_FILLING_IOC) != 0) ? "IOC" : "RETURN");
 
    // 3. CRITICAL: Require hedging account
    if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
