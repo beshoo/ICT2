@@ -393,10 +393,10 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
          spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
          effectiveStopPts = MathMax(g_stopLevel, spread) + 10;
 
-         if(orderType == ORDER_TYPE_BUY_STOP)
-            price = NormalizePrice(ask + effectiveStopPts * g_point);
+         if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_LIMIT)
+            price = NormalizePrice(ask + effectiveStopPts * g_point);  // must be above Ask
          else
-            price = NormalizePrice(bid - effectiveStopPts * g_point);
+            price = NormalizePrice(bid - effectiveStopPts * g_point);  // must be below Bid
       }
       else if(error == TRADE_RETCODE_NO_MONEY)
       {
@@ -1247,7 +1247,7 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
 
    string info = "";
    info += "========================================\n";
-   info += "       GRID HEDGE EA v2.0\n";
+   info += "       GRID HEDGE EA v4.0\n";
    info += "========================================\n";
    info += " Anchor:     " + DoubleToString(g_anchorPrice, g_digits) + "\n";
    info += " Session Lot: " + DoubleToString(g_sessionLotSize, 2) + "\n";
@@ -1257,8 +1257,8 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
    info += "   BUY:  " + IntegerToString(buyCount) + "    SELL: " + IntegerToString(sellCount) + "\n";
    info += "   Total: " + IntegerToString(buyCount + sellCount) + "\n";
    info += " PENDING\n";
-   info += "   Buy Stops:  " + IntegerToString(buyStopCount) + " / " + IntegerToString(GridOrders) + "\n";
-   info += "   Sell Stops: " + IntegerToString(sellStopCount) + " / " + IntegerToString(GridOrders) + "\n";
+   info += "   Above:  " + IntegerToString(buyStopCount) + " / " + IntegerToString(GridOrders) + "\n";
+   info += "   Below:  " + IntegerToString(sellStopCount) + " / " + IntegerToString(GridOrders) + "\n";
    info += "----------------------------------------\n";
    info += " TRADE STATS\n";
    info += "   Winning:  " + IntegerToString(winCount) + "  ($" + DoubleToString(winTotal, 2) + ")\n";
