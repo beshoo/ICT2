@@ -35,12 +35,17 @@ input bool     UseMarketCloseProtection = true;  // Enable market close protecti
 input int      HoursBeforeClose         = 2;     // Hours before market close to activate protection
 input int      TradingStartHour         = 1;     // Hour (server time) to start new trading day
 
+//=== Display Settings ===
+input int      StatusFontSize           = 9;     // Font size for chart status panel (8-16 recommended)
+
 //=== Direction Constants ===
 #define DIRECTION_UP   1
 #define DIRECTION_DOWN 2
 
 //=== UI Constants ===
-#define BTN_CLOSE_ALL  "GridEA_CloseAll"
+#define BTN_CLOSE_ALL       "GridEA_CloseAll"
+#define INFO_LABEL_PREFIX   "GridEA_Info_"
+#define MAX_INFO_LINES      40
 
 //=== Global Objects ===
 CTrade         trade;
@@ -1041,7 +1046,43 @@ void ExecuteFullClose(SOrderInfo &buyPositions[], SOrderInfo &sellPositions[],
 }
 
 //+------------------------------------------------------------------+
-//| CHART DISPLAY: Update the chart comment panel (v3 layout)         |
+//| CHART DISPLAY: Create OBJ_LABEL objects for the status panel      |
+//+------------------------------------------------------------------+
+void CreateInfoLabels()
+{
+   long chartID  = ChartID();
+   int  lineH    = StatusFontSize + 4;   // pixels per line
+
+   for(int i = 0; i < MAX_INFO_LINES; i++)
+   {
+      string name = INFO_LABEL_PREFIX + IntegerToString(i);
+      ObjectDelete(chartID, name);
+      ObjectCreate(chartID, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(chartID, name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
+      ObjectSetInteger(chartID, name, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(chartID, name, OBJPROP_YDISTANCE, 20 + i * lineH);
+      ObjectSetString(chartID,  name, OBJPROP_FONT,      "Courier New");
+      ObjectSetInteger(chartID, name, OBJPROP_FONTSIZE,  StatusFontSize);
+      ObjectSetInteger(chartID, name, OBJPROP_COLOR,     clrWhite);
+      ObjectSetString(chartID,  name, OBJPROP_TEXT,      "");
+      ObjectSetInteger(chartID, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartID, name, OBJPROP_HIDDEN,    true);
+      ObjectSetInteger(chartID, name, OBJPROP_ZORDER,    0);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CHART DISPLAY: Remove all status label objects                    |
+//+------------------------------------------------------------------+
+void DestroyInfoLabels()
+{
+   long chartID = ChartID();
+   for(int i = 0; i < MAX_INFO_LINES; i++)
+      ObjectDelete(chartID, INFO_LABEL_PREFIX + IntegerToString(i));
+}
+
+//+------------------------------------------------------------------+
+//| CHART DISPLAY: Update the status panel via OBJ_LABEL objects      |
 //+------------------------------------------------------------------+
 void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStopCount,
                      double totalProfit, double targetProfit, string status)
@@ -1054,8 +1095,8 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
    // Count winning/losing per side
    int buyWin = 0, buyLose = 0, sellWin = 0, sellLose = 0;
    double buyWinPL = 0.0, buyLosePL = 0.0, sellWinPL = 0.0, sellLosePL = 0.0;
-   int totalPositions = PositionsTotal();
-   for(int i = 0; i < totalPositions; i++)
+   int totalPos = PositionsTotal();
+   for(int i = 0; i < totalPos; i++)
    {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
@@ -1075,39 +1116,64 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
       }
    }
 
-   string info = "";
-   info += "========================================\n";
-   info += "       GRID HEDGE EA v3.0\n";
-   info += "========================================\n";
-   info += " Status:       " + status + "\n";
-   info += " Anchor Price: " + DoubleToString(g_anchorPrice, g_digits) + "\n";
-   info += " Session Lot:  " + DoubleToString(g_sessionLotSize, 2) + "\n";
-   info += " Grid Spacing: " + IntegerToString((int)GridSpacingPoints) + " pts\n";
-   info += " Half Grid:    " + IntegerToString(GridOrders / 2) + "\n";
-   info += "----------------------------------------\n";
-   info += " OPEN POSITIONS\n";
-   info += "   BUY:  " + IntegerToString(buyCount) + "  (+" + IntegerToString(buyWin) + " / -" + IntegerToString(buyLose) + ")\n";
-   info += "   SELL: " + IntegerToString(sellCount) + "  (+" + IntegerToString(sellWin) + " / -" + IntegerToString(sellLose) + ")\n";
-   info += "   BUY  P/L: $" + DoubleToString(buyWinPL + buyLosePL, 2) + "  (W:$" + DoubleToString(buyWinPL, 2) + " L:$" + DoubleToString(buyLosePL, 2) + ")\n";
-   info += "   SELL P/L: $" + DoubleToString(sellWinPL + sellLosePL, 2) + "  (W:$" + DoubleToString(sellWinPL, 2) + " L:$" + DoubleToString(sellLosePL, 2) + ")\n";
-   info += " PENDING ORDERS\n";
-   info += "   Buy Stops:  " + IntegerToString(buyStopCount) + " / " + IntegerToString(GridOrders) + "\n";
-   info += "   Sell Stops: " + IntegerToString(sellStopCount) + " / " + IntegerToString(GridOrders) + "\n";
-   info += " Total: " + IntegerToString(buyCount + sellCount + buyStopCount + sellStopCount) + "\n";
-   info += "----------------------------------------\n";
-   info += " Floating P/L:  $" + DoubleToString(totalProfit, 2) + "\n";
-   info += " Target (" + DoubleToString(TotalProfitPercent, 1) + "%): $" + DoubleToString(targetProfit, 2) + "\n";
-   info += " Progress:      " + DoubleToString(progress, 1) + "%\n";
-   info += "----------------------------------------\n";
-   info += " Balance:  $" + DoubleToString(balance, 2) + "\n";
-   info += " Equity:   $" + DoubleToString(equity, 2) + "\n";
-   info += " Drawdown: " + DoubleToString(drawdown, 1) + "%\n";
-   info += "----------------------------------------\n";
-   info += " Migration:    " + (EnableMigration ? "ON" : "OFF") + "\n";
-   info += " Market Close: " + (g_marketCloseMode ? "ACTIVE" : "Normal") + "\n";
-   info += "========================================\n";
+   // Build lines array
+   string lines[];
+   ArrayResize(lines, MAX_INFO_LINES);
+   int n = 0;
 
-   Comment(info);
+   lines[n++] = "================================";
+   lines[n++] = "    GRID HEDGE EA v3.0";
+   lines[n++] = "================================";
+   lines[n++] = " Status:      " + status;
+   lines[n++] = " Anchor:      " + DoubleToString(g_anchorPrice, g_digits);
+   lines[n++] = " Lot:         " + DoubleToString(g_sessionLotSize, 2);
+   lines[n++] = " Spacing:     " + IntegerToString((int)GridSpacingPoints) + " pts";
+   lines[n++] = " Half Grid:   " + IntegerToString(GridOrders / 2);
+   lines[n++] = "--------------------------------";
+   lines[n++] = " OPEN POSITIONS";
+   lines[n++] = "  BUY:  " + IntegerToString(buyCount)
+                + "  (+" + IntegerToString(buyWin)
+                + " / -" + IntegerToString(buyLose) + ")";
+   lines[n++] = "  SELL: " + IntegerToString(sellCount)
+                + "  (+" + IntegerToString(sellWin)
+                + " / -" + IntegerToString(sellLose) + ")";
+   lines[n++] = "  BUY  P/L: $" + DoubleToString(buyWinPL + buyLosePL, 2)
+                + " (W:$" + DoubleToString(buyWinPL, 2)
+                + " L:$" + DoubleToString(buyLosePL, 2) + ")";
+   lines[n++] = "  SELL P/L: $" + DoubleToString(sellWinPL + sellLosePL, 2)
+                + " (W:$" + DoubleToString(sellWinPL, 2)
+                + " L:$" + DoubleToString(sellLosePL, 2) + ")";
+   lines[n++] = "--------------------------------";
+   lines[n++] = " PENDING ORDERS";
+   lines[n++] = "  Buy Stops:  " + IntegerToString(buyStopCount)
+                + " / " + IntegerToString(GridOrders);
+   lines[n++] = "  Sell Stops: " + IntegerToString(sellStopCount)
+                + " / " + IntegerToString(GridOrders);
+   lines[n++] = " Total: "
+                + IntegerToString(buyCount + sellCount + buyStopCount + sellStopCount);
+   lines[n++] = "--------------------------------";
+   lines[n++] = " Floating P/L: $" + DoubleToString(totalProfit, 2);
+   lines[n++] = " Target (" + DoubleToString(TotalProfitPercent, 1)
+                + "%):  $" + DoubleToString(targetProfit, 2);
+   lines[n++] = " Progress:     " + DoubleToString(progress, 1) + "%";
+   lines[n++] = "--------------------------------";
+   lines[n++] = " Balance:  $" + DoubleToString(balance, 2);
+   lines[n++] = " Equity:   $" + DoubleToString(equity, 2);
+   lines[n++] = " Drawdown: " + DoubleToString(drawdown, 1) + "%";
+   lines[n++] = "--------------------------------";
+   lines[n++] = " Migration:    " + (EnableMigration ? "ON" : "OFF");
+   lines[n++] = " Market Close: " + (g_marketCloseMode ? "ACTIVE" : "Normal");
+   lines[n++] = "================================";
+
+   // Push lines to label objects
+   long chartID = ChartID();
+   for(int i = 0; i < MAX_INFO_LINES; i++)
+   {
+      string name = INFO_LABEL_PREFIX + IntegerToString(i);
+      string text = (i < n) ? lines[i] : "";
+      ObjectSetString(chartID, name, OBJPROP_TEXT, text);
+   }
+   ChartRedraw(chartID);
 }
 
 //+------------------------------------------------------------------+
@@ -1311,7 +1377,8 @@ int OnInit()
       }
    }
 
-   // 5. Create the Close All button on the chart
+   // 5. Create chart UI elements
+   CreateInfoLabels();
    CreateCloseAllButton();
 
    return INIT_SUCCEEDED;
@@ -1491,8 +1558,8 @@ void OnTick()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   DestroyInfoLabels();
    DestroyCloseAllButton();
-   Comment("");  // Clear chart display
    Print("GridHedgeEA v3.0 removed. Reason: ", reason,
          " — positions and orders preserved for restart.");
 }
