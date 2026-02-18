@@ -450,6 +450,7 @@ bool ModifyPendingOrder(ulong ticket, double newPrice)
 //+------------------------------------------------------------------+
 void DeleteAllPendingOrders()
 {
+   trade.SetAsyncMode(true);
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
       ulong ticket = OrderGetTicket(i);
@@ -461,6 +462,7 @@ void DeleteAllPendingOrders()
          Print("DeleteAllPendingOrders: Failed to delete #", ticket,
                " — ", trade.ResultRetcodeDescription());
    }
+   trade.SetAsyncMode(false);
 }
 
 //+------------------------------------------------------------------+
@@ -468,6 +470,7 @@ void DeleteAllPendingOrders()
 //+------------------------------------------------------------------+
 void CloseAllRemainingPositions()
 {
+   trade.SetAsyncMode(true);
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
@@ -479,6 +482,7 @@ void CloseAllRemainingPositions()
          Print("CloseAllRemainingPositions: Failed to close #", ticket,
                " — ", trade.ResultRetcodeDescription());
    }
+   trade.SetAsyncMode(false);
 }
 
 //+------------------------------------------------------------------+
@@ -1014,7 +1018,7 @@ void ExecuteFullClose(SOrderInfo &buyPositions[], SOrderInfo &sellPositions[],
    // === STEP 3: Delete all pending orders ===
    DeleteAllPendingOrders();
 
-   // === STEP 4: Close all positions via CloseBy ===
+   // === STEP 4: Close all positions via CloseBy (async for speed) ===
    SOrderInfo allBuys[], allSells[];
    CollectAndSortPositions(allBuys, allSells);
 
@@ -1022,11 +1026,13 @@ void ExecuteFullClose(SOrderInfo &buyPositions[], SOrderInfo &sellPositions[],
    int sCount = ArraySize(allSells);
    int pairs  = MathMin(bCount, sCount);
 
+   trade.SetAsyncMode(true);
    for(int i = 0; i < pairs; i++)
    {
       if(!trade.PositionCloseBy(allBuys[i].ticket, allSells[i].ticket))
          Print("ExecuteFullClose: PositionCloseBy failed — ", trade.ResultRetcodeDescription());
    }
+   trade.SetAsyncMode(false);
 
    // Close any remaining positions that couldn't be paired
    CloseAllRemainingPositions();
@@ -1154,16 +1160,18 @@ void CloseAllAndExit()
    // 1. Delete all pending orders
    DeleteAllPendingOrders();
 
-   // 2. Close via CloseBy where possible (saves spread)
+   // 2. Close via CloseBy where possible (saves spread, async for speed)
    SOrderInfo allBuys[], allSells[];
    CollectAndSortPositions(allBuys, allSells);
    int pairs = MathMin(ArraySize(allBuys), ArraySize(allSells));
+   trade.SetAsyncMode(true);
    for(int i = 0; i < pairs; i++)
    {
       trade.PositionCloseBy(allBuys[i].ticket, allSells[i].ticket);
    }
+   trade.SetAsyncMode(false);
 
-   // 3. Close any remaining positions normally
+   // 3. Close any remaining positions normally (also async internally)
    CloseAllRemainingPositions();
 
    // 4. Reset EA state
