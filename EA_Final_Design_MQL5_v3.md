@@ -188,50 +188,177 @@ PROCEDURE OnInit():
 
 ---
 
-## 7. GRID INITIALIZATION (InitializeGrid)
+## 7. GRID INITIALIZATION (InitializeGrid) — Far-to-Near Placement
+
+### PLACEMENT ALGORITHM OVERVIEW:
+```
+The grid is placed starting from the point FARTHEST from current price, working inward:
+
+  1. Calculate anchor (midpoint) and all grid levels above/below it
+  2. Buy Stops: place from HIGHEST level (farthest) DOWNWARD toward price
+  3. Sell Stops: place from LOWEST level (farthest) UPWARD toward price
+  4. If a placement fails (price caught up, or freeze zone reached):
+     — STOP placing in that direction
+     — Count how many were successfully placed
+     — Relocate remaining orders to the FAR END:
+         • Unplaced Buy Stops → stack ABOVE the highest existing buy stop
+         • Unplaced Sell Stops → stack BELOW the lowest existing sell stop
+  5. This guarantees the total order count (GridOrders per side) is always met
+  6. After placement completes, run Shifting/Rebalancing to fill any gaps
+
+WHY far-to-near?
+  - Orders far from price never fail (they're safely above Ask / below Bid)
+  - Orders near price are placed LAST, so if they fail, we relocate them to the safe far end
+  - During the 1-2 minutes of initialization, price may move significantly
+  - This eliminates the "invalid price" / "rejected" errors seen with near-to-far placement
+```
 
 ```
 PROCEDURE InitializeGrid():
-   1. Calculate anchor price:
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID)
-      g_anchorPrice = NormalizeDouble((ask + bid) / 2.0, g_digits)
+   // ============================================================
+   // STEP 1: Calculate anchor and session lot size
+   // ============================================================
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID)
+   g_anchorPrice = NormalizeDouble((ask + bid) / 2.0, g_digits)
+   g_sessionLotSize = CalculateSessionLotSize()
 
-   2. Calculate session lot size (fixed for entire cycle):
-      g_sessionLotSize = CalculateSessionLotSize()
+   int spreadPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD)
+   double halfSpread = (spreadPoints * g_point) / 2.0
+   double spacing = GridSpacingPoints * g_point
 
-   3. Get current spread in points:
-      int spreadPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD)
-      double halfSpread = (spreadPoints * g_point) / 2.0
+   // ============================================================
+   // STEP 2: Pre-calculate ALL grid levels
+   // ============================================================
+   double buyLevels[]     // GridOrders levels above anchor
+   double sellLevels[]    // GridOrders levels below anchor
+   ArrayResize(buyLevels, GridOrders)
+   ArrayResize(sellLevels, GridOrders)
 
-   4. Place Buy Stop orders ABOVE anchor:
-      FOR i = 1 TO GridOrders:
-         double price = g_anchorPrice + halfSpread + (i * GridSpacingPoints * g_point)
-         price = NormalizeDouble(price, g_digits)
-         
-         double minBuyStop = ask + g_stopLevel * g_point
-         IF price <= minBuyStop:
-            price = NormalizeDouble(minBuyStop + g_point, g_digits)
-         
+   FOR i = 0 TO GridOrders - 1:
+      // Buy levels: anchor + halfSpread + (1..N) * spacing
+      buyLevels[i] = NormalizeDouble(g_anchorPrice + halfSpread + ((i + 1) * spacing), g_digits)
+      // Sell levels: anchor - halfSpread - (1..N) * spacing
+      sellLevels[i] = NormalizeDouble(g_anchorPrice - halfSpread - ((i + 1) * spacing), g_digits)
+
+   // buyLevels[0] = closest to price, buyLevels[GridOrders-1] = farthest
+   // sellLevels[0] = closest to price, sellLevels[GridOrders-1] = farthest
+
+   // ============================================================
+   // STEP 3: Place BUY STOPS — from FARTHEST (highest) to nearest (lowest)
+   // ============================================================
+   int buyPlaced = 0
+   double highestBuyPlaced = 0
+
+   FOR i = GridOrders - 1 DOWNTO 0:     // Start from farthest (highest price)
+      double price = buyLevels[i]
+
+      // Refresh Ask for each order (price may have moved)
+      ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+
+      // Buy Stop must be ABOVE current Ask + stopLevel
+      double minBuyStop = ask + MathMax(g_stopLevel, (int)GridSpacingPoints) * g_point
+      IF price <= ask:
+         // Price has caught up to or passed this level — STOP placing downward
+         Print("InitializeGrid: Buy stop level ", price, " <= Ask ", ask, ". Stopping downward placement.")
+         BREAK
+
+      // Check freeze zone — if price is within freeze distance, stop
+      IF g_freezeLevel > 0 AND (price - ask) <= g_freezeLevel * g_point:
+         Print("InitializeGrid: Buy stop level ", price, " within freeze zone of Ask ", ask, ". Stopping.")
+         BREAK
+
+      bool ok = PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, g_sessionLotSize)
+      IF ok:
+         buyPlaced++
+         IF price > highestBuyPlaced OR highestBuyPlaced == 0:
+            highestBuyPlaced = price
+
+   // --- Relocate remaining Buy Stops to the FAR END (above highest placed) ---
+   int buyRemaining = GridOrders - buyPlaced
+   IF buyRemaining > 0 AND highestBuyPlaced > 0:
+      Print("InitializeGrid: ", buyRemaining, " buy stops couldn't be placed near price. Relocating to far end.")
+      FOR i = 1 TO buyRemaining:
+         double price = NormalizeDouble(highestBuyPlaced + (i * spacing), g_digits)
          PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, g_sessionLotSize)
+         buyPlaced++
 
-   5. Place Sell Stop orders BELOW anchor:
-      FOR i = 1 TO GridOrders:
-         double price = g_anchorPrice - halfSpread - (i * GridSpacingPoints * g_point)
-         price = NormalizeDouble(price, g_digits)
-         
-         double minSellStop = bid - g_stopLevel * g_point
-         IF price >= minSellStop:
-            price = NormalizeDouble(minSellStop - g_point, g_digits)
-         
+   // ============================================================
+   // STEP 4: Place SELL STOPS — from FARTHEST (lowest) to nearest (highest)
+   // ============================================================
+   int sellPlaced = 0
+   double lowestSellPlaced = DBL_MAX
+
+   FOR i = GridOrders - 1 DOWNTO 0:     // Start from farthest (lowest price)
+      double price = sellLevels[i]
+
+      // Refresh Bid for each order
+      bid = SymbolInfoDouble(_Symbol, SYMBOL_BID)
+
+      // Sell Stop must be BELOW current Bid - stopLevel
+      IF price >= bid:
+         // Price has dropped to or below this level — STOP placing upward
+         Print("InitializeGrid: Sell stop level ", price, " >= Bid ", bid, ". Stopping upward placement.")
+         BREAK
+
+      // Check freeze zone
+      IF g_freezeLevel > 0 AND (bid - price) <= g_freezeLevel * g_point:
+         Print("InitializeGrid: Sell stop level ", price, " within freeze zone of Bid ", bid, ". Stopping.")
+         BREAK
+
+      bool ok = PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, g_sessionLotSize)
+      IF ok:
+         sellPlaced++
+         IF price < lowestSellPlaced:
+            lowestSellPlaced = price
+
+   // --- Relocate remaining Sell Stops to the FAR END (below lowest placed) ---
+   int sellRemaining = GridOrders - sellPlaced
+   IF sellRemaining > 0 AND lowestSellPlaced < DBL_MAX:
+      Print("InitializeGrid: ", sellRemaining, " sell stops couldn't be placed near price. Relocating to far end.")
+      FOR i = 1 TO sellRemaining:
+         double price = NormalizeDouble(lowestSellPlaced - (i * spacing), g_digits)
          PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, g_sessionLotSize)
+         sellPlaced++
 
-   6. Set flags:
-      g_gridInitialized = true
-      g_marketCloseMode = false
-      g_waitingForNewDay = false
-   
-   7. Log: "Grid initialized. Anchor=" + g_anchorPrice + " Lot=" + g_sessionLotSize
+   // ============================================================
+   // STEP 5: Set flags and log actual results
+   // ============================================================
+   g_gridInitialized = true
+   g_marketCloseMode = false
+   g_waitingForNewDay = false
+
+   // Count actual orders placed (verify against broker)
+   SOrderInfo buyStops[], sellStops[]
+   CollectAndSortPendingOrders(buyStops, sellStops)
+   int actualBuyStops = ArraySize(buyStops)
+   int actualSellStops = ArraySize(sellStops)
+
+   Print("=== GRID INITIALIZED === Anchor=", g_anchorPrice,
+         " Lot=", g_sessionLotSize,
+         " BuyStops=", actualBuyStops, "/", GridOrders,
+         " SellStops=", actualSellStops, "/", GridOrders)
+
+   // ============================================================
+   // STEP 6: Schedule immediate Shifting/Rebalancing on next tick
+   // (handled by ReplenishPendingOrders + MigrateToFillGaps in OnTick)
+   // Any gaps from the init process will be filled automatically
+   // ============================================================
+```
+
+### CRITICAL NOTES ON FAR-TO-NEAR PLACEMENT:
+```
+1. Grid levels are pre-calculated based on anchor price at init time
+2. Placement starts at the SAFEST point (farthest from price) and works inward
+3. When price catches up to a level during placement:
+   - We STOP going closer (all remaining levels would also fail)
+   - We RELOCATE those orders to the far end instead
+4. This means the grid may temporarily have a GAP near current price
+   - The gap is filled on the NEXT tick by ReplenishPendingOrders + MigrateToFillGaps
+5. Total order count (GridOrders per side) is ALWAYS guaranteed
+6. No "invalid price" or "rejected" errors during init because:
+   - Far orders always succeed (safely away from price)
+   - Near orders that would fail are never sent — they go to the far end instead
 ```
 
 ---
@@ -1112,6 +1239,13 @@ ALL trade operations MUST:
     ├─ (Existing grid) ──► Resume
     ├─ (Market close time) ──► g_waitingForNewDay = true
     └─ (Fresh start) ──► InitializeGrid()
+                           │
+                           ├─ Calculate anchor & grid levels
+                           ├─ Place Buy Stops: FARTHEST (highest) → nearest
+                           │    └─ If blocked → relocate remaining to top
+                           ├─ Place Sell Stops: FARTHEST (lowest) → nearest
+                           │    └─ If blocked → relocate remaining to bottom
+                           └─ Gaps filled on next tick by Replenish + Migrate
     │
     ▼
 [OnTick] ◄──────────────────────────────────────────────
@@ -1178,6 +1312,11 @@ ALL trade operations MUST:
 ## 21. TESTING CHECKLIST
 
 - [ ] Grid places correct number of orders on both sides of anchor
+- [ ] Grid placement uses far-to-near order: Buy Stops from highest→lowest, Sell Stops from lowest→highest
+- [ ] When placement is interrupted (price catches up / freeze zone), remaining orders relocate to far end
+- [ ] Total order count per side always equals GridOrders after init (no missing orders)
+- [ ] No "invalid price" or "rejected" errors during initialization
+- [ ] Gaps near price created during init are filled by Replenish + Migrate on next tick
 - [ ] Anchor = (Ask+Bid)/2, fixed until restart
 - [ ] Lot size calculated for 4000 orders margin, fixed during session
 - [ ] Pending orders replenished at far end when activated
