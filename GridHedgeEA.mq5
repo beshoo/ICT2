@@ -460,7 +460,6 @@ void DeleteAllPendingOrders()
       if(!trade.OrderDelete(ticket))
          Print("DeleteAllPendingOrders: Failed to delete #", ticket,
                " — ", trade.ResultRetcodeDescription());
-      Sleep(100);
    }
 }
 
@@ -479,7 +478,6 @@ void CloseAllRemainingPositions()
       if(!trade.PositionClose(ticket))
          Print("CloseAllRemainingPositions: Failed to close #", ticket,
                " — ", trade.ResultRetcodeDescription());
-      Sleep(100);
    }
 }
 
@@ -1010,12 +1008,11 @@ void ExecuteFullClose(SOrderInfo &buyPositions[], SOrderInfo &sellPositions[],
          if(!hedgeResult)
             Print("ExecuteFullClose: Hedge Buy failed — ", trade.ResultRetcodeDescription());
       }
-      Sleep(500);
+      Sleep(100);
    }
 
    // === STEP 3: Delete all pending orders ===
    DeleteAllPendingOrders();
-   Sleep(500);
 
    // === STEP 4: Close all positions via CloseBy ===
    SOrderInfo allBuys[], allSells[];
@@ -1029,7 +1026,6 @@ void ExecuteFullClose(SOrderInfo &buyPositions[], SOrderInfo &sellPositions[],
    {
       if(!trade.PositionCloseBy(allBuys[i].ticket, allSells[i].ticket))
          Print("ExecuteFullClose: PositionCloseBy failed — ", trade.ResultRetcodeDescription());
-      Sleep(200);
    }
 
    // Close any remaining positions that couldn't be paired
@@ -1055,6 +1051,30 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
    double progress   = (targetProfit > 0.0) ? (totalProfit / targetProfit * 100.0) : 0.0;
    double drawdown   = (balance > 0.0) ? ((balance - equity) / balance * 100.0) : 0.0;
 
+   // Count winning/losing per side
+   int buyWin = 0, buyLose = 0, sellWin = 0, sellLose = 0;
+   double buyWinPL = 0.0, buyLosePL = 0.0, sellWinPL = 0.0, sellLosePL = 0.0;
+   int totalPositions = PositionsTotal();
+   for(int i = 0; i < totalPositions; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL)  != _Symbol)    continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != MagicNumber) continue;
+      double pnl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      int posType = (int)PositionGetInteger(POSITION_TYPE);
+      if(posType == POSITION_TYPE_BUY)
+      {
+         if(pnl >= 0.0) { buyWin++;  buyWinPL  += pnl; }
+         else            { buyLose++; buyLosePL += pnl; }
+      }
+      else
+      {
+         if(pnl >= 0.0) { sellWin++;  sellWinPL  += pnl; }
+         else            { sellLose++; sellLosePL += pnl; }
+      }
+   }
+
    string info = "";
    info += "========================================\n";
    info += "       GRID HEDGE EA v3.0\n";
@@ -1065,11 +1085,15 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
    info += " Grid Spacing: " + IntegerToString((int)GridSpacingPoints) + " pts\n";
    info += " Half Grid:    " + IntegerToString(GridOrders / 2) + "\n";
    info += "----------------------------------------\n";
-   info += " BUY Positions:   " + IntegerToString(buyCount) + "\n";
-   info += " SELL Positions:  " + IntegerToString(sellCount) + "\n";
-   info += " Buy Stops:       " + IntegerToString(buyStopCount) + "\n";
-   info += " Sell Stops:      " + IntegerToString(sellStopCount) + "\n";
-   info += " Total Orders:    " + IntegerToString(buyCount + sellCount + buyStopCount + sellStopCount) + "\n";
+   info += " OPEN POSITIONS\n";
+   info += "   BUY:  " + IntegerToString(buyCount) + "  (+" + IntegerToString(buyWin) + " / -" + IntegerToString(buyLose) + ")\n";
+   info += "   SELL: " + IntegerToString(sellCount) + "  (+" + IntegerToString(sellWin) + " / -" + IntegerToString(sellLose) + ")\n";
+   info += "   BUY  P/L: $" + DoubleToString(buyWinPL + buyLosePL, 2) + "  (W:$" + DoubleToString(buyWinPL, 2) + " L:$" + DoubleToString(buyLosePL, 2) + ")\n";
+   info += "   SELL P/L: $" + DoubleToString(sellWinPL + sellLosePL, 2) + "  (W:$" + DoubleToString(sellWinPL, 2) + " L:$" + DoubleToString(sellLosePL, 2) + ")\n";
+   info += " PENDING ORDERS\n";
+   info += "   Buy Stops:  " + IntegerToString(buyStopCount) + " / " + IntegerToString(GridOrders) + "\n";
+   info += "   Sell Stops: " + IntegerToString(sellStopCount) + " / " + IntegerToString(GridOrders) + "\n";
+   info += " Total: " + IntegerToString(buyCount + sellCount + buyStopCount + sellStopCount) + "\n";
    info += "----------------------------------------\n";
    info += " Floating P/L:  $" + DoubleToString(totalProfit, 2) + "\n";
    info += " Target (" + DoubleToString(TotalProfitPercent, 1) + "%): $" + DoubleToString(targetProfit, 2) + "\n";
@@ -1129,7 +1153,6 @@ void CloseAllAndExit()
 
    // 1. Delete all pending orders
    DeleteAllPendingOrders();
-   Sleep(500);
 
    // 2. Close via CloseBy where possible (saves spread)
    SOrderInfo allBuys[], allSells[];
@@ -1138,7 +1161,6 @@ void CloseAllAndExit()
    for(int i = 0; i < pairs; i++)
    {
       trade.PositionCloseBy(allBuys[i].ticket, allSells[i].ticket);
-      Sleep(200);
    }
 
    // 3. Close any remaining positions normally
