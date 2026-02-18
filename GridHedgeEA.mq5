@@ -336,6 +336,11 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
          Print("CRITICAL: Not enough money to place order!");
          return false;
       }
+      else if(error == TRADE_RETCODE_LIMIT_ORDERS)
+      {
+         Print("CRITICAL: Broker pending order limit reached! Cannot place more orders.");
+         return false;
+      }
       else if(error == TRADE_RETCODE_TOO_MANY_REQUESTS)
       {
          Sleep(2000);
@@ -624,113 +629,144 @@ void InitializeGrid()
    }
 
    // ================================================================
-   // STEP 3: Place BUY STOPS — from FARTHEST (highest) to nearest
-   // Start at index GridOrders-1 (highest), work down to index 0
+   // STEP 3: INTERLEAVED far-to-near placement
+   // Alternate 1 Buy Stop + 1 Sell Stop per level, starting from
+   // the farthest level and working inward. This ensures both sides
+   // get equal share if the broker has a pending order limit.
    // ================================================================
    int    buyPlaced        = 0;
-   double highestBuyPlaced = 0.0;
-
-   for(int i = GridOrders - 1; i >= 0; i--)
-   {
-      if(IsStopped()) break;
-
-      double price = buyLevels[i];
-
-      // Refresh Ask on each order — price moves during the loop
-      ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-      // If price has caught up to this level, stop going closer
-      // All lower levels would also be invalid, so break out
-      if(price <= ask)
-      {
-         Print("InitializeGrid: Buy level[", i, "]=", price,
-               " <= Ask=", ask, " — stopping downward placement.");
-         break;
-      }
-
-      // If within freeze zone, also stop (broker won't accept)
-      if(g_freezeLevel > 0 && (price - ask) <= g_freezeLevel * g_point)
-      {
-         Print("InitializeGrid: Buy level[", i, "]=", price,
-               " within freeze zone of Ask=", ask, " — stopping.");
-         break;
-      }
-
-      if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, g_sessionLotSize))
-      {
-         buyPlaced++;
-         if(price > highestBuyPlaced) highestBuyPlaced = price;
-      }
-   }
-
-   // Relocate remaining buy stops that couldn't be placed near price
-   // Stack them ABOVE the highest successfully placed buy stop
-   int buyRemaining = GridOrders - buyPlaced;
-   if(buyRemaining > 0 && highestBuyPlaced > 0.0)
-   {
-      Print("InitializeGrid: ", buyRemaining,
-            " buy stops blocked near price — relocating to far end above ", highestBuyPlaced);
-      for(int i = 1; i <= buyRemaining; i++)
-      {
-         if(IsStopped()) break;
-         double price = NormalizePrice(highestBuyPlaced + (i * spacing));
-         if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, g_sessionLotSize))
-            buyPlaced++;
-      }
-   }
-
-   // ================================================================
-   // STEP 4: Place SELL STOPS — from FARTHEST (lowest) to nearest
-   // Start at index GridOrders-1 (lowest), work up to index 0
-   // ================================================================
    int    sellPlaced       = 0;
+   double highestBuyPlaced = 0.0;
    double lowestSellPlaced = DBL_MAX;
+   bool   buyBlocked       = false;   // Price caught up on buy side
+   bool   sellBlocked      = false;   // Price caught up on sell side
+   bool   brokerLimitHit   = false;   // Broker pending order limit reached
+   int    consecutiveFails = 0;       // Detect broker limit via consecutive failures
 
    for(int i = GridOrders - 1; i >= 0; i--)
    {
       if(IsStopped()) break;
+      if(brokerLimitHit) break;
 
-      double price = sellLevels[i];
-
-      // Refresh Bid on each order
-      bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-      // If price has dropped to or below this level, stop going closer
-      if(price >= bid)
+      // --- Try Buy Stop at level i (farthest first) ---
+      if(!buyBlocked)
       {
-         Print("InitializeGrid: Sell level[", i, "]=", price,
-               " >= Bid=", bid, " — stopping upward placement.");
-         break;
+         double buyPrice = buyLevels[i];
+         ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+         if(buyPrice <= ask)
+         {
+            buyBlocked = true;
+            Print("InitializeGrid: Buy level[", i, "]=", buyPrice,
+                  " <= Ask=", ask, " — buy side blocked near price.");
+         }
+         else if(g_freezeLevel > 0 && (buyPrice - ask) <= g_freezeLevel * g_point)
+         {
+            buyBlocked = true;
+            Print("InitializeGrid: Buy level[", i, "]=", buyPrice,
+                  " within freeze zone of Ask=", ask, " — buy side blocked.");
+         }
+         else
+         {
+            if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, buyPrice, g_sessionLotSize))
+            {
+               buyPlaced++;
+               consecutiveFails = 0;
+               if(buyPrice > highestBuyPlaced) highestBuyPlaced = buyPrice;
+            }
+            else
+            {
+               consecutiveFails++;
+               if(consecutiveFails >= 4)
+               {
+                  brokerLimitHit = true;
+                  Print("InitializeGrid: ", consecutiveFails,
+                        " consecutive failures — broker limit likely reached.");
+                  break;
+               }
+            }
+         }
       }
 
-      // If within freeze zone, also stop
-      if(g_freezeLevel > 0 && (bid - price) <= g_freezeLevel * g_point)
+      if(IsStopped()) break;
+      if(brokerLimitHit) break;
+
+      // --- Try Sell Stop at level i (farthest first) ---
+      if(!sellBlocked)
       {
-         Print("InitializeGrid: Sell level[", i, "]=", price,
-               " within freeze zone of Bid=", bid, " — stopping.");
-         break;
+         double sellPrice = sellLevels[i];
+         bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+         if(sellPrice >= bid)
+         {
+            sellBlocked = true;
+            Print("InitializeGrid: Sell level[", i, "]=", sellPrice,
+                  " >= Bid=", bid, " — sell side blocked near price.");
+         }
+         else if(g_freezeLevel > 0 && (bid - sellPrice) <= g_freezeLevel * g_point)
+         {
+            sellBlocked = true;
+            Print("InitializeGrid: Sell level[", i, "]=", sellPrice,
+                  " within freeze zone of Bid=", bid, " — sell side blocked.");
+         }
+         else
+         {
+            if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, sellPrice, g_sessionLotSize))
+            {
+               sellPlaced++;
+               consecutiveFails = 0;
+               if(sellPrice < lowestSellPlaced) lowestSellPlaced = sellPrice;
+            }
+            else
+            {
+               consecutiveFails++;
+               if(consecutiveFails >= 4)
+               {
+                  brokerLimitHit = true;
+                  Print("InitializeGrid: ", consecutiveFails,
+                        " consecutive failures — broker limit likely reached.");
+                  break;
+               }
+            }
+         }
       }
 
-      if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, g_sessionLotSize))
-      {
-         sellPlaced++;
-         if(price < lowestSellPlaced) lowestSellPlaced = price;
-      }
+      // If both sides are blocked near price, no point continuing inward
+      if(buyBlocked && sellBlocked) break;
    }
 
-   // Relocate remaining sell stops that couldn't be placed near price
-   // Stack them BELOW the lowest successfully placed sell stop
-   int sellRemaining = GridOrders - sellPlaced;
-   if(sellRemaining > 0 && lowestSellPlaced < DBL_MAX)
+   // ================================================================
+   // STEP 4: Relocate remaining orders to the far end
+   // Only if broker limit was NOT hit (no point adding more if limit reached)
+   // ================================================================
+   if(!brokerLimitHit)
    {
-      Print("InitializeGrid: ", sellRemaining,
-            " sell stops blocked near price — relocating to far end below ", lowestSellPlaced);
-      for(int i = 1; i <= sellRemaining; i++)
+      int buyRemaining = GridOrders - buyPlaced;
+      if(buyRemaining > 0 && highestBuyPlaced > 0.0)
       {
-         if(IsStopped()) break;
-         double price = NormalizePrice(lowestSellPlaced - (i * spacing));
-         if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, g_sessionLotSize))
-            sellPlaced++;
+         Print("InitializeGrid: ", buyRemaining,
+               " buy stops blocked near price — relocating above ", highestBuyPlaced);
+         for(int i = 1; i <= buyRemaining; i++)
+         {
+            if(IsStopped()) break;
+            double price = NormalizePrice(highestBuyPlaced + (i * spacing));
+            if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, price, g_sessionLotSize))
+               buyPlaced++;
+         }
+      }
+
+      int sellRemaining = GridOrders - sellPlaced;
+      if(sellRemaining > 0 && lowestSellPlaced < DBL_MAX)
+      {
+         Print("InitializeGrid: ", sellRemaining,
+               " sell stops blocked near price — relocating below ", lowestSellPlaced);
+         for(int i = 1; i <= sellRemaining; i++)
+         {
+            if(IsStopped()) break;
+            double price = NormalizePrice(lowestSellPlaced - (i * spacing));
+            if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, price, g_sessionLotSize))
+               sellPlaced++;
+         }
       }
    }
 
