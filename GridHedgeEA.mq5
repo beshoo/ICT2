@@ -698,7 +698,12 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
       if(buyStopCount > 0)
          highestAbove = buyStopOrders[buyStopCount - 1].price; // sorted ascending, last = highest
       else
-         highestAbove = GetHighestPositionPrice(POSITION_TYPE_BUY);
+      {
+         // Fallback: find highest position of the TYPE created by above-anchor orders
+         // Stop mode: Buy Stop → BUY positions  |  Limit mode: Sell Limit → SELL positions
+         int aboveFallbackPosType = (GridOrderMode == MODE_LIMIT_ORDERS) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+         highestAbove = GetHighestPositionPrice(aboveFallbackPosType);
+      }
 
       if(highestAbove <= 0.0)
          highestAbove = ask + g_stopLevel * g_point;
@@ -727,7 +732,12 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
       if(sellStopCount > 0)
          lowestBelow = sellStopOrders[0].price; // sorted ascending, first = lowest
       else
-         lowestBelow = GetLowestPositionPrice(POSITION_TYPE_SELL);
+      {
+         // Fallback: find lowest position of the TYPE created by below-anchor orders
+         // Stop mode: Sell Stop → SELL positions  |  Limit mode: Buy Limit → BUY positions
+         int belowFallbackPosType = (GridOrderMode == MODE_LIMIT_ORDERS) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+         lowestBelow = GetLowestPositionPrice(belowFallbackPosType);
+      }
 
       if(lowestBelow == DBL_MAX || lowestBelow <= 0.0)
          lowestBelow = bid - g_stopLevel * g_point;
@@ -849,10 +859,18 @@ void TryBasketClose(SOrderInfo &buyPositions[],  SOrderInfo &sellPositions[],
    // STEP 6: Migrate 3 farthest pending orders of the LOSER'S TYPE
    //         to the 3 closed position prices (BEFORE closing)
    // ===================================================================
-   if(loserType == POSITION_TYPE_BUY)
+   // Determine which pending order array corresponds to the loser's position type:
+   // Stop mode:  BUY loser → Buy Stops (above-anchor) | SELL loser → Sell Stops (below-anchor)
+   // Limit mode: BUY loser → Buy Limits (below-anchor) | SELL loser → Sell Limits (above-anchor)
+   bool migrateFromAbove;
+   if(GridOrderMode == MODE_STOP_ORDERS)
+      migrateFromAbove = (loserType == POSITION_TYPE_BUY);
+   else
+      migrateFromAbove = (loserType == POSITION_TYPE_SELL);
+
+   if(migrateFromAbove)
    {
-      // Loser is BUY → migrate 3 farthest above-anchor (BUY STOP or BUY LIMIT) orders
-      // buyStopOrders sorted ASCENDING: last indices = highest = farthest
+      // Migrate 3 farthest above-anchor orders (highest prices = last indices)
       if(buyStopCount >= 3)
       {
          ModifyPendingOrder(buyStopOrders[buyStopCount - 1].ticket, closedPrice1);
@@ -862,8 +880,7 @@ void TryBasketClose(SOrderInfo &buyPositions[],  SOrderInfo &sellPositions[],
    }
    else
    {
-      // Loser is SELL → migrate 3 farthest below-anchor (SELL STOP or SELL LIMIT) orders
-      // sellStopOrders sorted ASCENDING: index 0 = lowest = farthest when price is up
+      // Migrate 3 farthest below-anchor orders (lowest prices = first indices)
       if(sellStopCount >= 3)
       {
          ModifyPendingOrder(sellStopOrders[0].ticket, closedPrice1);
@@ -1541,6 +1558,11 @@ void OnTick()
    // ============================================================
    if(buyCount > 0 && sellCount > 0)
    {
+      // Re-collect pending orders after replenishment (they may have changed)
+      CollectAndSortPendingOrders(buyStopOrders, sellStopOrders);
+      buyStopCount  = ArraySize(buyStopOrders);
+      sellStopCount = ArraySize(sellStopOrders);
+
       TryBasketClose(buyPositions, sellPositions, buyCount, sellCount,
                      buyStopOrders, sellStopOrders, buyStopCount, sellStopCount);
       // After basket operation wait for next tick to reprocess
