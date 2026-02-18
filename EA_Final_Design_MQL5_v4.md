@@ -27,7 +27,7 @@ This EA implements a **Bidirectional Grid + Hedge** strategy with triple-close b
 
 ```mql5
 //=== Grid Settings ===
-input int      GridOrders         = 100;       // Number of pending orders PER SIDE (100 Buy Stops + 100 Sell Stops)
+input int      GridOrders         = 100;       // Number of pending orders PER SIDE (100 above + 100 below)
 input double   GridSpacingPoints  = 50;        // Distance between each order in POINTS
 input int      MagicNumber        = 777777;    // Unique EA identifier
 
@@ -36,7 +36,26 @@ input double   MinLot             = 0.01;      // Minimum lot size (used if bala
 
 //=== Profit Settings ===
 input double   TotalProfitPercent = 1.0;       // % of account balance to trigger full close & restart
-// NOTE: Basket close profit threshold = GridSpacingPoints (same as distance between orders)
+
+//=== Triple Close Settings ===
+input bool     EnableTripleClose  = true;      // Enable/disable triple close basket mechanism
+
+//=== Grid Order Type ===
+enum ENUM_GRID_ORDER_TYPE {
+   MODE_STOP_ORDERS,    // Buy Stop + Sell Stop (default)
+   MODE_LIMIT_ORDERS    // Sell Limit (above) + Buy Limit (below)
+};
+input ENUM_GRID_ORDER_TYPE GridOrderMode = MODE_STOP_ORDERS;  // Pending order type for grid
+
+//=== Market Order Grid (Level-Based) ===
+input bool     EnableMarketOrderGrid   = false;     // Enable market order grid mode
+input double   MarketGridStartPrice    = 0;         // Starting reference price (0 = auto mid-price)
+
+enum ENUM_MARKET_GRID_DIRECTION {
+   MARKET_GRID_BUY_ABOVE,    // BUY above start, SELL below
+   MARKET_GRID_SELL_ABOVE    // SELL above start, BUY below
+};
+input ENUM_MARKET_GRID_DIRECTION MarketGridAboveDir = MARKET_GRID_BUY_ABOVE;  // Direction above/below start
 
 //=== Migration Settings ===
 input bool     EnableMigration    = true;      // Enable/disable gap-filling migration feature
@@ -101,6 +120,16 @@ double g_maxLot;
 double g_lotStep;
 int    g_stopLevel;
 int    g_freezeLevel;
+
+// Market Order Grid — price levels stored in arrays
+double g_marketGridLevels[];         // Price levels above and below start
+int    g_marketGridDirections[];     // 0 = BUY, 1 = SELL for each level
+int    g_marketGridLevelCount = 0;   // Current number of active levels
+double g_marketGridStartPrice = 0.0; // The starting reference price used
+
+// Direction constants
+#define DIRECTION_UP   0
+#define DIRECTION_DOWN 1
 
 // Structure for position/order info
 struct SOrderInfo
@@ -566,6 +595,11 @@ PROCEDURE OnTick():
          MigrateToFillGaps(DIRECTION_DOWN, sellPositions, sellCount,
                            buyStopOrders, sellStopOrders, buyStopCount, sellStopCount)
 
+    // ============================================
+    // STEP 8.5: Market Order Grid — check price-level crossings
+    // ============================================
+    ProcessMarketGridLevels()
+
    // ============================================
    // STEP 9: Update chart display
    // ============================================
@@ -583,109 +617,135 @@ This is the heart of the strategy.
 PROCEDURE TryBasketClose(buyPositions[], sellPositions[], buyCount, sellCount,
                          buyStopOrders[], sellStopOrders[], buyStopCount, sellStopCount):
 
-   double requiredProfitMoney = PointsToMoney(GridSpacingPoints, g_sessionLotSize)
+   // Guard: skip if triple close is disabled
+   IF !EnableTripleClose: RETURN
 
-   // -----------------------------------------------------------------
-   // SCENARIO A: Price is RISING
-   // BUY positions are winning, SELL positions are losing
-   // Close: Lowest Sell (by price) + Lowest 2 Buys (by price)
-   // -----------------------------------------------------------------
-   IF buyCount >= 2 AND sellCount >= 1:
-      
-      // Arrays sorted ASCENDING by price
-      SOrderInfo loserSell   = sellPositions[0]         // lowest price sell = most losing
-      SOrderInfo winnerBuy1  = buyPositions[0]           // lowest price buy
-      SOrderInfo winnerBuy2  = buyPositions[1]           // second lowest price buy
-      
-      double combinedProfit = loserSell.profit + winnerBuy1.profit + winnerBuy2.profit
-      
-      IF combinedProfit >= requiredProfitMoney:
-         
-         // STEP 1: Record the 3 closing prices BEFORE closing
-         double closedPrice1 = loserSell.price
-         double closedPrice2 = winnerBuy1.price
-         double closedPrice3 = winnerBuy2.price
-         
-         // STEP 2: Determine which Buy is MORE profitable for CloseBy
-         // CloseBy: MOST profitable Buy closes against the losing Sell
-         // Other Buy: normal close
-         ulong closeByBuyTicket, normalCloseBuyTicket
-         IF winnerBuy1.profit >= winnerBuy2.profit:
-            closeByBuyTicket    = winnerBuy1.ticket
-            normalCloseBuyTicket = winnerBuy2.ticket
-         ELSE:
-            closeByBuyTicket    = winnerBuy2.ticket
-            normalCloseBuyTicket = winnerBuy1.ticket
-         
-         // STEP 3: Migrate 3 farthest SELL STOP orders to the 3 closed prices
-         // Do this BEFORE closing to ensure we have valid price references
-         // sellStopOrders[] sorted ASCENDING: index 0 = lowest price = farthest when price is up
-         IF sellStopCount >= 3:
-            ModifyPendingOrder(sellStopOrders[0].ticket, closedPrice1)
-            ModifyPendingOrder(sellStopOrders[1].ticket, closedPrice2)
-            ModifyPendingOrder(sellStopOrders[2].ticket, closedPrice3)
-         
-         // STEP 4: Execute closes
-         trade.PositionCloseBy(closeByBuyTicket, loserSell.ticket)
-         Sleep(200)
-         trade.PositionClose(normalCloseBuyTicket)
-         
-         RETURN
+   // ===================================================================
+   // STEP 1: Merge ALL positions into one combined array
+   // ===================================================================
+   SOrderInfo allPositions[]
+   int totalPos = buyCount + sellCount
+   ArrayResize(allPositions, totalPos)
+   int idx = 0
+   FOR i = 0 TO buyCount - 1:
+      allPositions[idx] = buyPositions[i]
+      idx++
+   FOR i = 0 TO sellCount - 1:
+      allPositions[idx] = sellPositions[i]
+      idx++
 
-   // -----------------------------------------------------------------
-   // SCENARIO B: Price is FALLING
-   // SELL positions are winning, BUY positions are losing
-   // Close: Highest Buy (by price) + Highest 2 Sells (by price)
-   // -----------------------------------------------------------------
-   IF sellCount >= 2 AND buyCount >= 1:
-      
-      SOrderInfo loserBuy    = buyPositions[buyCount - 1]         // highest price buy = most losing
-      SOrderInfo winnerSell1 = sellPositions[sellCount - 1]       // highest price sell
-      SOrderInfo winnerSell2 = sellPositions[sellCount - 2]       // second highest price sell
-      
-      double combinedProfit = loserBuy.profit + winnerSell1.profit + winnerSell2.profit
-      
-      IF combinedProfit >= requiredProfitMoney:
-         
-         // STEP 1: Record prices
-         double closedPrice1 = loserBuy.price
-         double closedPrice2 = winnerSell1.price
-         double closedPrice3 = winnerSell2.price
-         
-         // STEP 2: Most profitable Sell for CloseBy
-         ulong closeBySellTicket, normalCloseSellTicket
-         IF winnerSell1.profit >= winnerSell2.profit:
-            closeBySellTicket    = winnerSell1.ticket
-            normalCloseSellTicket = winnerSell2.ticket
-         ELSE:
-            closeBySellTicket    = winnerSell2.ticket
-            normalCloseSellTicket = winnerSell1.ticket
-         
-         // STEP 3: Migrate 3 farthest BUY STOP orders to the 3 closed prices
-         // buyStopOrders[] sorted ASCENDING: last indices = highest = farthest when price is down
-         IF buyStopCount >= 3:
-            ModifyPendingOrder(buyStopOrders[buyStopCount - 1].ticket, closedPrice1)
-            ModifyPendingOrder(buyStopOrders[buyStopCount - 2].ticket, closedPrice2)
-            ModifyPendingOrder(buyStopOrders[buyStopCount - 3].ticket, closedPrice3)
-         
-         // STEP 4: Execute closes
-         trade.PositionCloseBy(closeBySellTicket, loserBuy.ticket)
-         Sleep(200)
-         trade.PositionClose(normalCloseSellTicket)
-         
-         RETURN
+   // ===================================================================
+   // STEP 2: Find the LARGEST LOSER (most negative profit)
+   // ===================================================================
+   int loserIdx = -1
+   double worstLoss = 0.0
+   FOR i = 0 TO totalPos - 1:
+      IF allPositions[i].profit < worstLoss:
+         worstLoss = allPositions[i].profit
+         loserIdx = i
+
+   IF loserIdx == -1: RETURN   // No losing position found
+
+   SOrderInfo loser = allPositions[loserIdx]
+
+   // ===================================================================
+   // STEP 3: Find the 2 LARGEST WINNERS (highest positive profit)
+   //         They must be the OPPOSITE type of the loser
+   // ===================================================================
+   int winner1Idx = -1, winner2Idx = -1
+   double bestProfit1 = 0.0, bestProfit2 = 0.0
+
+   int loserType = loser.type  // POSITION_TYPE_BUY or POSITION_TYPE_SELL
+   int winnerType = (loserType == POSITION_TYPE_BUY) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY
+
+   FOR i = 0 TO totalPos - 1:
+      IF i == loserIdx: CONTINUE
+      IF allPositions[i].type != winnerType: CONTINUE
+      IF allPositions[i].profit <= 0: CONTINUE   // Must be in profit
+
+      IF allPositions[i].profit > bestProfit1:
+         // Shift current best to second best
+         bestProfit2 = bestProfit1
+         winner2Idx = winner1Idx
+         bestProfit1 = allPositions[i].profit
+         winner1Idx = i
+      ELSE IF allPositions[i].profit > bestProfit2:
+         bestProfit2 = allPositions[i].profit
+         winner2Idx = i
+
+   // Need exactly 2 winners
+   IF winner1Idx == -1 OR winner2Idx == -1: RETURN
+
+   SOrderInfo winner1 = allPositions[winner1Idx]
+   SOrderInfo winner2 = allPositions[winner2Idx]
+
+   // ===================================================================
+   // STEP 4: Check profit condition
+   //         Combined profit of 2 winners must exceed |loser's loss|
+   // ===================================================================
+   double winnersProfit = winner1.profit + winner2.profit
+   double loserLoss = MathAbs(loser.profit)
+
+   IF winnersProfit <= loserLoss: RETURN   // Not profitable enough
+
+   // ===================================================================
+   // STEP 5: Record the 3 closing prices BEFORE closing
+   // ===================================================================
+   double closedPrice1 = loser.price
+   double closedPrice2 = winner1.price
+   double closedPrice3 = winner2.price
+
+   // ===================================================================
+   // STEP 6: Migrate 3 farthest pending orders of the LOSER'S type
+   //         to the 3 closed position prices (BEFORE closing)
+   // ===================================================================
+   IF loserType == POSITION_TYPE_BUY:
+      // Loser is BUY → migrate 3 farthest BUY STOP orders
+      // buyStopOrders sorted ASCENDING: last indices = highest = farthest
+      IF buyStopCount >= 3:
+         ModifyPendingOrder(buyStopOrders[buyStopCount - 1].ticket, closedPrice1)
+         ModifyPendingOrder(buyStopOrders[buyStopCount - 2].ticket, closedPrice2)
+         ModifyPendingOrder(buyStopOrders[buyStopCount - 3].ticket, closedPrice3)
+   ELSE:
+      // Loser is SELL → migrate 3 farthest SELL STOP orders
+      // sellStopOrders sorted ASCENDING: index 0 = lowest = farthest when price is up
+      IF sellStopCount >= 3:
+         ModifyPendingOrder(sellStopOrders[0].ticket, closedPrice1)
+         ModifyPendingOrder(sellStopOrders[1].ticket, closedPrice2)
+         ModifyPendingOrder(sellStopOrders[2].ticket, closedPrice3)
+
+   // ===================================================================
+   // STEP 7: Execute closes
+   //         CloseBy: MOST profitable winner closes against the loser
+   //         Normal close: other winner
+   // ===================================================================
+   ulong closeByWinnerTicket, normalCloseWinnerTicket
+   IF winner1.profit >= winner2.profit:
+      closeByWinnerTicket    = winner1.ticket
+      normalCloseWinnerTicket = winner2.ticket
+   ELSE:
+      closeByWinnerTicket    = winner2.ticket
+      normalCloseWinnerTicket = winner1.ticket
+
+   trade.PositionCloseBy(closeByWinnerTicket, loser.ticket)
+   Sleep(200)
+   trade.PositionClose(normalCloseWinnerTicket)
+
+   RETURN
 ```
 
 ### CRITICAL NOTES ON BASKET CLOSE:
 ```
-1. Migration happens BEFORE closing — to capture exact prices while positions still exist
-2. 3 farthest pending orders of the LOSER'S TYPE get moved to the 3 closed position prices
-3. Why loser's type? 
-   - Closed 1 Sell (loser) + 2 Buys (winners) → migrate 3 Sell Stops to those prices
-   - Closed 1 Buy (loser) + 2 Sells (winners) → migrate 3 Buy Stops to those prices
-4. CloseBy pairs the MOST PROFITABLE winner with the loser (saves spread)
-5. Number of pending orders stays constant (3 moved, not added/removed)
-6. Only ONE basket close per tick — return immediately after to reprocess
+1. Triple close is guarded by EnableTripleClose input — can be toggled on/off
+2. Selection is by PROFIT MAGNITUDE, not by price position:
+   - Loser = the single position with the most negative profit (across both BUY and SELL)
+   - 2 Winners = the two positions with the highest positive profit, from the OPPOSITE side of the loser
+3. Condition: combined profit of 2 winners must be GREATER THAN |loser's loss| (net positive)
+4. Migration happens BEFORE closing — to capture exact prices while positions still exist
+5. 3 farthest pending orders of the LOSER'S TYPE get moved to the 3 closed position prices
+6. CloseBy pairs the MOST PROFITABLE winner with the loser (saves spread)
+7. Number of pending orders stays constant (3 moved, not added/removed)
+8. Only ONE basket close per tick — return immediately after to reprocess
 ```
 
 ---
@@ -870,6 +930,13 @@ PROCEDURE MigrateToFillGaps(direction, marketPositions[], posCount,
                              buyStopOrders[], sellStopOrders[], 
                              buyStopCount, sellStopCount):
    
+   // ===================================================================
+   // RANGE VALIDATION: target price must fall BETWEEN:
+   //   - highest SELL position or Sell Stop price (lower boundary)
+   //   - lowest BUY position or Buy Stop price   (upper boundary)
+   // This prevents orders from being shifted outside the logical grid range
+   // ===================================================================
+
    IF direction == DIRECTION_UP:
       // Only BUY positions exist, price is going up
       // Move farthest (lowest) Sell Stops up to fill gap
@@ -880,8 +947,12 @@ PROCEDURE MigrateToFillGaps(direction, marketPositions[], posCount,
       double lowestBuyStop = (buyStopCount > 0) ? buyStopOrders[0].price : lowestBuyPos
       double highestSellStop = sellStopOrders[sellStopCount - 1].price
       
-      double gapTop = MathMin(lowestBuyPos, lowestBuyStop)
-      double gapBottom = highestSellStop
+      // Define valid range boundaries
+      double rangeUpperBound = MathMin(lowestBuyPos, lowestBuyStop)   // lowest BUY or Buy Stop
+      double rangeLowerBound = highestSellStop                        // highest Sell Stop
+      
+      double gapTop = rangeUpperBound
+      double gapBottom = rangeLowerBound
       
       IF gapTop - gapBottom <= GridSpacingPoints * g_point * 2: RETURN
       
@@ -893,6 +964,10 @@ PROCEDURE MigrateToFillGaps(direction, marketPositions[], posCount,
       FOR i = 0 TO ordersToMove - 1:
          double targetPrice = gapTop - ((i + 1) * GridSpacingPoints * g_point)
          targetPrice = NormalizeDouble(targetPrice, g_digits)
+         
+         // RANGE CHECK: ensure target is within valid range
+         IF targetPrice <= rangeLowerBound OR targetPrice >= rangeUpperBound:
+            CONTINUE   // Skip — outside valid range
          
          double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID)
          IF targetPrice < bid - g_stopLevel * g_point:
@@ -909,8 +984,12 @@ PROCEDURE MigrateToFillGaps(direction, marketPositions[], posCount,
       double highestSellStop = (sellStopCount > 0) ? sellStopOrders[sellStopCount - 1].price : highestSellPos
       double lowestBuyStop = buyStopOrders[0].price
       
-      double gapBottom = MathMax(highestSellPos, highestSellStop)
-      double gapTop = lowestBuyStop
+      // Define valid range boundaries
+      double rangeLowerBound = MathMax(highestSellPos, highestSellStop)  // highest SELL or Sell Stop
+      double rangeUpperBound = lowestBuyStop                             // lowest Buy Stop
+      
+      double gapBottom = rangeLowerBound
+      double gapTop = rangeUpperBound
       
       IF gapTop - gapBottom <= GridSpacingPoints * g_point * 2: RETURN
       
@@ -924,10 +1003,177 @@ PROCEDURE MigrateToFillGaps(direction, marketPositions[], posCount,
          double targetPrice = gapBottom + ((i + 1) * GridSpacingPoints * g_point)
          targetPrice = NormalizeDouble(targetPrice, g_digits)
          
+         // RANGE CHECK: ensure target is within valid range
+         IF targetPrice <= rangeLowerBound OR targetPrice >= rangeUpperBound:
+            CONTINUE   // Skip — outside valid range
+         
          double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK)
          IF targetPrice > ask + g_stopLevel * g_point:
             IF MathAbs(buyStopOrders[idx].price - targetPrice) > g_point:
                ModifyPendingOrder(buyStopOrders[idx].ticket, targetPrice)
+```
+
+---
+
+## 14a. GRID ORDER TYPE — STOP ORDERS vs LIMIT ORDERS
+
+When `GridOrderMode = MODE_LIMIT_ORDERS`, the grid uses **Sell Limit** above price (instead of Buy Stop) and **Buy Limit** below price (instead of Sell Stop). The spacing and order count remain identical.
+
+```
+MAPPING TABLE:
+   MODE_STOP_ORDERS (default):
+      Above anchor: ORDER_TYPE_BUY_STOP   → triggers BUY when price rises to level
+      Below anchor: ORDER_TYPE_SELL_STOP   → triggers SELL when price falls to level
+
+   MODE_LIMIT_ORDERS:
+      Above anchor: ORDER_TYPE_SELL_LIMIT  → triggers SELL when price rises to level
+      Below anchor: ORDER_TYPE_BUY_LIMIT   → triggers BUY when price falls to level
+```
+
+### Helper Function:
+```
+FUNCTION GetAbovePendingType() -> int:
+   IF GridOrderMode == MODE_LIMIT_ORDERS:
+      RETURN ORDER_TYPE_SELL_LIMIT
+   RETURN ORDER_TYPE_BUY_STOP
+
+FUNCTION GetBelowPendingType() -> int:
+   IF GridOrderMode == MODE_LIMIT_ORDERS:
+      RETURN ORDER_TYPE_BUY_LIMIT
+   RETURN ORDER_TYPE_SELL_STOP
+```
+
+### IMPACT ON EXISTING FUNCTIONS:
+```
+1. InitializeGrid():     Use GetAbovePendingType() / GetBelowPendingType() instead of hardcoded types
+2. PlacePendingOrder():   Must handle ORDER_TYPE_SELL_LIMIT and ORDER_TYPE_BUY_LIMIT:
+                          - Sell Limit: price must be ABOVE current Ask
+                          - Buy Limit: price must be BELOW current Bid
+3. ModifyPendingOrder():  Must handle all 4 order types for stop/freeze level checks
+4. ReplenishPendingOrders(): Use GetAbovePendingType() / GetBelowPendingType()
+5. CollectAndSortPendingOrders(): Collect all 4 order types, sort into "above" and "below" arrays
+```
+
+### CRITICAL NOTE:
+```
+The SPACING and ORDER COUNT are IDENTICAL in both modes.
+Only the ORDER TYPE changes. The price levels stay the same.
+In Limit mode, Sell Limits above price will trigger SELL when price reaches up,
+and Buy Limits below price will trigger BUY when price reaches down.
+```
+
+---
+
+## 14b. MARKET ORDER GRID — PRICE-LEVEL ARRAY SYSTEM (NEW)
+
+When `EnableMarketOrderGrid = true`, this system operates INDEPENDENTLY from the pending order grid. It calculates price levels above and below a starting point, stores them in arrays, and opens market orders when price crosses those levels.
+
+### Initialization:
+```
+PROCEDURE InitializeMarketGridLevels():
+   // Determine starting price
+   IF MarketGridStartPrice > 0:
+      g_marketGridStartPrice = MarketGridStartPrice
+   ELSE:
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID)
+      g_marketGridStartPrice = NormalizeDouble((ask + bid) / 2.0, g_digits)
+
+   double spacing = GridSpacingPoints * g_point
+   int totalLevels = GridOrders * 2   // GridOrders above + GridOrders below
+
+   ArrayResize(g_marketGridLevels, totalLevels)
+   ArrayResize(g_marketGridDirections, totalLevels)
+   g_marketGridLevelCount = totalLevels
+
+   int idx = 0
+
+   // Levels ABOVE starting price
+   FOR i = 1 TO GridOrders:
+      double level = NormalizeDouble(g_marketGridStartPrice + (i * spacing), g_digits)
+      g_marketGridLevels[idx] = level
+      IF MarketGridAboveDir == MARKET_GRID_BUY_ABOVE:
+         g_marketGridDirections[idx] = 0   // 0 = BUY
+      ELSE:
+         g_marketGridDirections[idx] = 1   // 1 = SELL
+      idx++
+
+   // Levels BELOW starting price
+   FOR i = 1 TO GridOrders:
+      double level = NormalizeDouble(g_marketGridStartPrice - (i * spacing), g_digits)
+      g_marketGridLevels[idx] = level
+      IF MarketGridAboveDir == MARKET_GRID_BUY_ABOVE:
+         g_marketGridDirections[idx] = 1   // Below = SELL (opposite of above)
+      ELSE:
+         g_marketGridDirections[idx] = 0   // Below = BUY (opposite of above)
+      idx++
+
+   Print("=== MARKET GRID INITIALIZED === Start=", g_marketGridStartPrice,
+         " Levels=", g_marketGridLevelCount, " Spacing=", GridSpacingPoints, "pts")
+```
+
+### Tick Processing:
+```
+PROCEDURE ProcessMarketGridLevels():
+   IF !EnableMarketOrderGrid: RETURN
+   IF g_marketGridLevelCount <= 0: RETURN
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID)
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+
+   // Scan all active levels
+   FOR i = g_marketGridLevelCount - 1 DOWNTO 0:   // Reverse loop for safe removal
+      double level = g_marketGridLevels[i]
+      bool triggered = false
+
+      // Check if price has reached or crossed this level
+      // For levels ABOVE start: triggered when Ask >= level
+      // For levels BELOW start: triggered when Bid <= level
+      IF level > g_marketGridStartPrice:
+         IF ask >= level: triggered = true
+      ELSE:
+         IF bid <= level: triggered = true
+
+      IF triggered:
+         // Open market order based on direction
+         IF g_marketGridDirections[i] == 0:
+            trade.Buy(g_sessionLotSize, _Symbol, 0, 0, 0, "MarketGrid BUY at " + DoubleToString(level, g_digits))
+         ELSE:
+            trade.Sell(g_sessionLotSize, _Symbol, 0, 0, 0, "MarketGrid SELL at " + DoubleToString(level, g_digits))
+
+         Print("MarketGrid: ", (g_marketGridDirections[i] == 0 ? "BUY" : "SELL"),
+               " triggered at level ", level)
+
+         // REMOVE this level from array (shift remaining elements)
+         RemoveMarketGridLevel(i)
+```
+
+### Remove Level Helper:
+```
+FUNCTION RemoveMarketGridLevel(index):
+   IF index < 0 OR index >= g_marketGridLevelCount: RETURN
+
+   // Shift all elements after 'index' one position to the left
+   FOR j = index TO g_marketGridLevelCount - 2:
+      g_marketGridLevels[j] = g_marketGridLevels[j + 1]
+      g_marketGridDirections[j] = g_marketGridDirections[j + 1]
+
+   g_marketGridLevelCount--
+   ArrayResize(g_marketGridLevels, g_marketGridLevelCount)
+   ArrayResize(g_marketGridDirections, g_marketGridLevelCount)
+```
+
+### CRITICAL NOTES ON MARKET ORDER GRID:
+```
+1. This system is INDEPENDENT from the pending order grid
+2. Levels are stored in arrays — when triggered, the level is REMOVED (one-shot)
+3. The same GridSpacingPoints and GridOrders are used for level calculation
+4. Direction is controlled by MarketGridAboveDir:
+   - MARKET_GRID_BUY_ABOVE: BUY above start, SELL below start
+   - MARKET_GRID_SELL_ABOVE: SELL above start, BUY below start
+5. MarketGridStartPrice = 0 means auto-calculate from (Ask+Bid)/2
+6. Levels are checked on every tick — once triggered, they cannot re-trigger
+7. All market orders use the same g_sessionLotSize as the pending grid
 ```
 
 ---
@@ -1267,24 +1513,29 @@ ALL trade operations MUST:
     ▼
 [Both BUY and SELL exist?]
     │
-    ├─ YES ──► [Basket Close: 1 loser + 2 winners]
-    │            1. Record 3 prices
-    │            2. Migrate 3 farthest opposite pendings to those prices
-    │            3. CloseBy (most profitable winner vs loser)
-    │            4. Normal close (other winner)
-    │            RETURN
-    │
-    ▼ NO (single direction)
+     ├─ YES ──► [Basket Close (if EnableTripleClose): 1 largest loser + 2 largest winners (by profit)]
+     │            1. Find largest loser (most negative profit)
+     │            2. Find 2 largest winners (opposite type, highest profit)
+     │            3. Check: winners combined profit > |loser loss|
+     │            4. Migrate 3 farthest pendings of loser's type to closed prices
+     │            5. CloseBy + normal close
+     │            RETURN
+     │
+     ▼ NO (single direction)
 [Count > Half Grid?]
-    │
-    ├─ YES ──► [Gradual Close: close 1 most profitable]
-    │            Migrate 1 opposite pending to closed price
-    │
-    ▼
+     │
+     ├─ YES ──► [Gradual Close: close 1 most profitable]
+     │            Migrate 1 opposite pending to closed price
+     │
+     ▼
 [Gap-filling Migration] (if enabled)
-    │ Fill gaps between Buy/Sell zones with opposite pendings
-    │
-    ▼
+     │ Fill gaps — target must be within [highest SELL/SellStop, lowest BUY/BuyStop] range
+     │
+     ▼
+[Market Order Grid] (if EnableMarketOrderGrid)
+     │ Check price-level crossings → open market order → remove level from array
+     │
+     ▼
 [Update Chart Display]
     │
     ▼
@@ -1320,13 +1571,26 @@ ALL trade operations MUST:
 - [ ] Anchor = (Ask+Bid)/2, fixed until restart
 - [ ] Lot size calculated for 4000 orders margin, fixed during session
 - [ ] Pending orders replenished at far end when activated
-- [ ] Basket close: correct 3 positions (1 loser + 2 winners by price)
+- [ ] Basket close: selects 1 largest loser + 2 largest winners BY PROFIT MAGNITUDE
+- [ ] Basket close condition: winners' combined profit > |loser's loss| (net positive)
+- [ ] EnableTripleClose = false → no basket closes occur
+- [ ] EnableTripleClose = true → basket closes work correctly
 - [ ] CloseBy pairs MOST PROFITABLE winner with loser
 - [ ] After basket close: 3 farthest pendings of LOSER's type migrate to closed prices
 - [ ] Migration happens BEFORE closing
 - [ ] Gradual close: triggers when single-direction count > GridOrders/2
 - [ ] Gradual close: closes 1 most profitable per tick, migrates 1 opposite pending
-- [ ] Gap-filling: moves farthest opposite pendings to fill gaps
+- [ ] Gap-filling: moved target price validated within [highest SELL/SellStop, lowest BUY/BuyStop] range
+- [ ] Gap-filling: orders outside valid range are skipped
+- [ ] GridOrderMode = MODE_STOP_ORDERS → Buy Stop above, Sell Stop below (default)
+- [ ] GridOrderMode = MODE_LIMIT_ORDERS → Sell Limit above, Buy Limit below
+- [ ] Same spacing and count in both stop and limit modes
+- [ ] EnableMarketOrderGrid = true → levels populate above/below start price
+- [ ] Market grid: market order opens when price crosses a level
+- [ ] Market grid: triggered level is removed from array (one-shot)
+- [ ] MarketGridAboveDir = BUY_ABOVE → BUY above start, SELL below
+- [ ] MarketGridAboveDir = SELL_ABOVE → SELL above start, BUY below
+- [ ] MarketGridStartPrice = 0 → auto uses (Ask+Bid)/2
 - [ ] Total profit target: hedge→delete→CloseBy→restart
 - [ ] Market close protection: no new orders, close at breakeven
 - [ ] Auto-restart next trading day with fresh grid
