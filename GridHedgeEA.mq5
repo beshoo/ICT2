@@ -629,7 +629,27 @@ void InitializeGrid()
    }
 
    // ================================================================
-   // STEP 3: INTERLEAVED far-to-near placement
+   // STEP 3: Pre-check broker pending order limit
+   // ================================================================
+   int brokerOrderLimit = (int)AccountInfoInteger(ACCOUNT_LIMIT_ORDERS);
+   int existingPending  = OrdersTotal();
+   int slotsAvailable   = (brokerOrderLimit == 0) ? INT_MAX : (brokerOrderLimit - existingPending);
+
+   if(brokerOrderLimit > 0 && slotsAvailable <= 0)
+   {
+      Print("InitializeGrid: Broker order limit (", brokerOrderLimit,
+            ") fully consumed by ", existingPending, " existing orders. Cannot place grid.");
+      return;
+   }
+   if(brokerOrderLimit > 0)
+   {
+      Print("InitializeGrid: BrokerLimit=", brokerOrderLimit,
+            " Existing=", existingPending,
+            " SlotsAvailable=", slotsAvailable);
+   }
+
+   // ================================================================
+   // STEP 4: INTERLEAVED far-to-near placement
    // Alternate 1 Buy Stop + 1 Sell Stop per level, starting from
    // the farthest level and working inward. This ensures both sides
    // get equal share if the broker has a pending order limit.
@@ -791,7 +811,10 @@ void InitializeGrid()
    }
    else
    {
-      Print("InitializeGrid: No orders placed (trading disabled?) — grid NOT initialized.");
+      Print("InitializeGrid: No orders placed — grid NOT initialized.",
+            " BrokerOrderLimit=", brokerOrderLimit,
+            " ExistingPending=", existingPending,
+            " Check: account type supports pending orders? Other EAs using order slots?");
    }
 }
 
@@ -1378,6 +1401,29 @@ int OnInit()
    {
       Alert("GridHedgeEA: This EA requires a HEDGING account! EA will not start.");
       return INIT_FAILED;
+   }
+
+   // 3b. Check broker pending order limit
+   int brokerOrderLimit = (int)AccountInfoInteger(ACCOUNT_LIMIT_ORDERS);
+   int existingPending  = OrdersTotal();
+   int slotsNeeded      = GridOrders * 2;  // buy stops + sell stops
+   int slotsAvailable   = (brokerOrderLimit == 0) ? INT_MAX : (brokerOrderLimit - existingPending);
+
+   Print("GridHedgeEA v3.0: BrokerOrderLimit=", brokerOrderLimit,
+         " ExistingPending=", existingPending,
+         " SlotsNeeded=", slotsNeeded,
+         " SlotsAvailable=", (brokerOrderLimit == 0) ? "unlimited" : IntegerToString(slotsAvailable));
+
+   if(brokerOrderLimit > 0 && slotsAvailable <= 0)
+   {
+      Alert("GridHedgeEA: Broker pending order limit (", brokerOrderLimit,
+            ") already reached with ", existingPending, " existing orders. EA cannot start.");
+      return INIT_FAILED;
+   }
+   if(brokerOrderLimit > 0 && slotsAvailable < slotsNeeded)
+   {
+      Print("WARNING: Only ", slotsAvailable, " order slots available but ",
+            slotsNeeded, " needed. Grid will be partially placed.");
    }
 
    // 4. Check for existing EA orders/positions (for restart recovery)
