@@ -20,6 +20,7 @@
 input int      GridOrders         = 100;     // Number of pending orders PER SIDE
 input double   GridSpacingPoints  = 50;      // Distance between each order in POINTS
 input int      MagicNumber        = 777777;  // Unique EA identifier
+input int      MaxOrdersPerTick   = 10;      // Max pending orders placed per tick (replenish rate)
 
 //=== Lot Size Settings ===
 input double   MinLot             = 0.01;    // Minimum lot size
@@ -829,8 +830,8 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))           return;
 
-   // Rate-limit: place at most this many new orders per tick
-   const int MAX_REPLENISH_PER_TICK = 5;
+   // Rate-limit: place at most this many new orders per tick (per side)
+   int maxPerSide = MathMax(MaxOrdersPerTick / 2, 1);  // split budget across buy + sell
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -849,7 +850,7 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
          highestBuyStop = ask + g_stopLevel * g_point;
 
       int placed = 0;
-      for(int i = 1; i <= missingBuys && placed < MAX_REPLENISH_PER_TICK; i++)
+      for(int i = 1; i <= missingBuys && placed < maxPerSide; i++)
       {
          if(IsStopped()) return;
          double newPrice = NormalizePrice(highestBuyStop + (i * GridSpacingPoints * g_point));
@@ -859,7 +860,7 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
                placed++;
          }
       }
-      if(missingBuys > MAX_REPLENISH_PER_TICK)
+      if(missingBuys > maxPerSide)
          Print("ReplenishPendingOrders: ", missingBuys, " buy stops missing, placed ",
                placed, " this tick (rate-limited).");
    }
@@ -878,7 +879,7 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
          lowestSellStop = bid - g_stopLevel * g_point;
 
       int placed = 0;
-      for(int i = 1; i <= missingSells && placed < MAX_REPLENISH_PER_TICK; i++)
+      for(int i = 1; i <= missingSells && placed < maxPerSide; i++)
       {
          if(IsStopped()) return;
          double newPrice = NormalizePrice(lowestSellStop - (i * GridSpacingPoints * g_point));
@@ -888,7 +889,7 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
                placed++;
          }
       }
-      if(missingSells > MAX_REPLENISH_PER_TICK)
+      if(missingSells > maxPerSide)
          Print("ReplenishPendingOrders: ", missingSells, " sell stops missing, placed ",
                placed, " this tick (rate-limited).");
    }
