@@ -1,30 +1,52 @@
 //+------------------------------------------------------------------+
 //|                                                  GridHedgeEA.mq5 |
-//|                  Bidirectional Grid + Hedge Expert Advisor v2.0   |
+//|                  Bidirectional Grid + Hedge Expert Advisor v4.0   |
 //|                                                                    |
-//| Strategy: Places Buy Stops above and Sell Stops below an anchor   |
-//| price, replenishes activated orders, uses triple-close basket      |
-//| mechanism with order migration, and restarts after profit target.  |
+//| Strategy: Places pending orders above and below an anchor price,  |
+//| replenishes activated orders, uses triple-close basket mechanism  |
+//| (profit-based selection) with order migration, range-validated    |
+//| gap-filling, optional limit-order grid, market order grid, and   |
+//| restarts after profit target.                                     |
 //+------------------------------------------------------------------+
-#property copyright   "Grid Hedge EA v2.0"
-#property version     "2.00"
+#property copyright   "Grid Hedge EA v4.0"
+#property version     "4.00"
 #property strict
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\OrderInfo.mqh>
 
-//=== Input Parameters ===
-input int      GridOrders         = 100;     // Number of pending orders PER SIDE
+//=== Grid Settings ===
+input int      GridOrders         = 100;     // Number of pending orders PER SIDE (100 above + 100 below)
 input double   GridSpacingPoints  = 50;      // Distance between each order in POINTS
 input int      MagicNumber        = 777777;  // Unique EA identifier
 input double   MinLot             = 0.01;    // Minimum lot size
 input double   TotalProfitPercent = 1.0;     // % of account balance to trigger full close & restart
 input bool     EnableMigration    = true;    // Enable/disable gap-filling migration feature
 
+//=== Triple Close Settings ===
+input bool     EnableTripleClose  = true;    // Enable/disable triple close basket mechanism
+
+//=== Grid Order Type ===
+enum ENUM_GRID_ORDER_TYPE {
+   MODE_STOP_ORDERS,    // Buy Stop + Sell Stop (default)
+   MODE_LIMIT_ORDERS    // Sell Limit (above) + Buy Limit (below)
+};
+input ENUM_GRID_ORDER_TYPE GridOrderMode = MODE_STOP_ORDERS; // Pending order type for grid
+
+//=== Market Order Grid (Level-Based) ===
+input bool     EnableMarketOrderGrid   = false;  // Enable market order grid mode
+input double   MarketGridStartPrice    = 0;      // Starting reference price (0 = auto mid-price)
+
+enum ENUM_MARKET_GRID_DIRECTION {
+   MARKET_GRID_BUY_ABOVE,    // BUY above start, SELL below
+   MARKET_GRID_SELL_ABOVE    // SELL above start, BUY below
+};
+input ENUM_MARKET_GRID_DIRECTION MarketGridAboveDir = MARKET_GRID_BUY_ABOVE; // Direction above/below start
+
 //=== Direction Constants ===
-#define DIRECTION_UP   1
-#define DIRECTION_DOWN 2
+#define DIRECTION_UP   0
+#define DIRECTION_DOWN 1
 
 //=== UI Constants ===
 #define BTN_CLOSE_ALL  "GridEA_CloseAll"
@@ -60,6 +82,12 @@ struct SOrderInfo
    int    type;
 };
 
+//=== Market Order Grid State ===
+double g_marketGridLevels[];         // Price levels above and below start
+int    g_marketGridDirections[];     // 0 = BUY, 1 = SELL for each level
+int    g_marketGridLevelCount = 0;   // Current number of active levels
+double g_marketGridStartPrice = 0.0; // The starting reference price used
+
 //+------------------------------------------------------------------+
 //| UTILITY: Normalize price to valid tick size multiple              |
 //| NormalizeDouble only ensures decimal places — this also ensures   |
@@ -71,6 +99,30 @@ double NormalizePrice(double price)
    if(g_tickSize > 0.0)
       price = MathRound(price / g_tickSize) * g_tickSize;
    return NormalizeDouble(price, g_digits);
+}
+
+//+------------------------------------------------------------------+
+//| UTILITY: Return the pending order type placed ABOVE the anchor   |
+//| Stop mode: Buy Stop (activates BUY when price rises)             |
+//| Limit mode: Sell Limit (triggers SELL when price rises to level) |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE GetAbovePendingType()
+{
+   if(GridOrderMode == MODE_LIMIT_ORDERS)
+      return ORDER_TYPE_SELL_LIMIT;
+   return ORDER_TYPE_BUY_STOP;
+}
+
+//+------------------------------------------------------------------+
+//| UTILITY: Return the pending order type placed BELOW the anchor   |
+//| Stop mode: Sell Stop (activates SELL when price falls)           |
+//| Limit mode: Buy Limit (triggers BUY when price falls to level)   |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE GetBelowPendingType()
+{
+   if(GridOrderMode == MODE_LIMIT_ORDERS)
+      return ORDER_TYPE_BUY_LIMIT;
+   return ORDER_TYPE_SELL_STOP;
 }
 
 //+------------------------------------------------------------------+
@@ -135,12 +187,23 @@ void CollectAndSortPositions(SOrderInfo &buyPositions[], SOrderInfo &sellPositio
 }
 
 //+------------------------------------------------------------------+
-//| UTILITY: Collect and sort pending orders into buy/sell stop arrays|
+//| UTILITY: Collect and sort pending orders into above/below arrays  |
+//|                                                                    |
+//| buyStopOrders  = ABOVE-anchor pending orders                      |
+//|   Stop mode:  ORDER_TYPE_BUY_STOP                                 |
+//|   Limit mode: ORDER_TYPE_SELL_LIMIT                               |
+//|                                                                    |
+//| sellStopOrders = BELOW-anchor pending orders                      |
+//|   Stop mode:  ORDER_TYPE_SELL_STOP                                |
+//|   Limit mode: ORDER_TYPE_BUY_LIMIT                                |
 //+------------------------------------------------------------------+
 void CollectAndSortPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrders[])
 {
    ArrayResize(buyStopOrders,  0);
    ArrayResize(sellStopOrders, 0);
+
+   ENUM_ORDER_TYPE aboveType = GetAbovePendingType();
+   ENUM_ORDER_TYPE belowType = GetBelowPendingType();
 
    int total = OrdersTotal();
    for(int i = 0; i < total; i++)
@@ -157,13 +220,13 @@ void CollectAndSortPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellSt
       info.lots   = OrderGetDouble(ORDER_VOLUME_CURRENT);
       info.type   = (int)OrderGetInteger(ORDER_TYPE);
 
-      if(info.type == ORDER_TYPE_BUY_STOP)
+      if(info.type == (int)aboveType)
       {
          int sz = ArraySize(buyStopOrders);
          ArrayResize(buyStopOrders, sz + 1);
          buyStopOrders[sz] = info;
       }
-      else if(info.type == ORDER_TYPE_SELL_STOP)
+      else if(info.type == (int)belowType)
       {
          int sz = ArraySize(sellStopOrders);
          ArrayResize(sellStopOrders, sz + 1);
@@ -279,11 +342,25 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
       {
          price = NormalizePrice(bid - effectiveStopPts * g_point);
       }
+      else if(orderType == ORDER_TYPE_SELL_LIMIT && price <= ask)
+      {
+         // Sell Limit must be ABOVE current Ask
+         price = NormalizePrice(ask + effectiveStopPts * g_point);
+      }
+      else if(orderType == ORDER_TYPE_BUY_LIMIT && price >= bid)
+      {
+         // Buy Limit must be BELOW current Bid
+         price = NormalizePrice(bid - effectiveStopPts * g_point);
+      }
 
       if(orderType == ORDER_TYPE_BUY_STOP)
          result = trade.BuyStop(lots, price, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "GridEA BuyStop");
       else if(orderType == ORDER_TYPE_SELL_STOP)
          result = trade.SellStop(lots, price, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "GridEA SellStop");
+      else if(orderType == ORDER_TYPE_SELL_LIMIT)
+         result = trade.SellLimit(lots, price, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "GridEA SellLimit");
+      else if(orderType == ORDER_TYPE_BUY_LIMIT)
+         result = trade.BuyLimit(lots, price, _Symbol, 0, 0, ORDER_TIME_GTC, 0, "GridEA BuyLimit");
 
       if(result) return true;
 
@@ -373,7 +450,7 @@ bool ModifyPendingOrder(ulong ticket, double newPrice)
       double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       int    ordType = (int)OrderGetInteger(ORDER_TYPE);
 
-      // Validate price vs stop level
+      // Validate price vs stop level for all 4 order types
       if(ordType == ORDER_TYPE_BUY_STOP)
       {
          if(newPrice <= ask + g_stopLevel * g_point)
@@ -388,6 +465,26 @@ bool ModifyPendingOrder(ulong ticket, double newPrice)
          if(newPrice >= bid - g_stopLevel * g_point)
          {
             Print("ModifyPendingOrder: SellStop price ", newPrice,
+                  " too close to Bid ", bid, " — skipping.");
+            return false;
+         }
+      }
+      else if(ordType == ORDER_TYPE_SELL_LIMIT)
+      {
+         // Sell Limit must remain ABOVE Ask
+         if(newPrice <= ask + g_stopLevel * g_point)
+         {
+            Print("ModifyPendingOrder: SellLimit price ", newPrice,
+                  " too close to Ask ", ask, " — skipping.");
+            return false;
+         }
+      }
+      else if(ordType == ORDER_TYPE_BUY_LIMIT)
+      {
+         // Buy Limit must remain BELOW Bid
+         if(newPrice >= bid - g_stopLevel * g_point)
+         {
+            Print("ModifyPendingOrder: BuyLimit price ", newPrice,
                   " too close to Bid ", bid, " — skipping.");
             return false;
          }
@@ -515,31 +612,41 @@ void InitializeGrid()
    int buyPlaced  = 0;
    int sellPlaced = 0;
 
-   // 3. INTERLEAVED placement: alternate 1 Buy Stop + 1 Sell Stop per iteration
+   // 3. INTERLEAVED placement: alternate above + below per iteration
    //    This builds both sides simultaneously so fewer orders activate during placement.
+   ENUM_ORDER_TYPE aboveType = GetAbovePendingType();
+   ENUM_ORDER_TYPE belowType = GetBelowPendingType();
+
    for(int i = 1; i <= GridOrders; i++)
    {
       if(IsStopped()) break;
 
-      // --- Place Buy Stop i ---
+      // --- Place above-anchor order i ---
       ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double buyPrice = NormalizePrice(g_anchorPrice + halfSpread + (i * GridSpacingPoints * g_point));
-      if(buyPrice <= ask)
-         buyPrice = NormalizePrice(ask + MathMax(g_stopLevel, 1) * g_point);
-      if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, buyPrice, g_sessionLotSize))
+      double abovePrice = NormalizePrice(g_anchorPrice + halfSpread + (i * GridSpacingPoints * g_point));
+      if(aboveType == ORDER_TYPE_BUY_STOP && abovePrice <= ask)
+         abovePrice = NormalizePrice(ask + MathMax(g_stopLevel, 1) * g_point);
+      else if(aboveType == ORDER_TYPE_SELL_LIMIT && abovePrice <= ask)
+         abovePrice = NormalizePrice(ask + MathMax(g_stopLevel, 1) * g_point);
+      if(PlacePendingOrder(aboveType, abovePrice, g_sessionLotSize))
          buyPlaced++;
 
       if(IsStopped()) break;
 
-      // --- Place Sell Stop i ---
+      // --- Place below-anchor order i ---
       bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double sellPrice = NormalizePrice(g_anchorPrice - halfSpread - (i * GridSpacingPoints * g_point));
-      if(sellPrice >= bid)
+      double belowPrice = NormalizePrice(g_anchorPrice - halfSpread - (i * GridSpacingPoints * g_point));
+      if(belowType == ORDER_TYPE_SELL_STOP && belowPrice >= bid)
       {
          int curSpread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-         sellPrice = NormalizePrice(bid - MathMax(g_stopLevel, curSpread) * g_point - g_point);
+         belowPrice = NormalizePrice(bid - MathMax(g_stopLevel, curSpread) * g_point - g_point);
       }
-      if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, sellPrice, g_sessionLotSize))
+      else if(belowType == ORDER_TYPE_BUY_LIMIT && belowPrice >= bid)
+      {
+         int curSpread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+         belowPrice = NormalizePrice(bid - MathMax(g_stopLevel, curSpread) * g_point - g_point);
+      }
+      if(PlacePendingOrder(belowType, belowPrice, g_sessionLotSize))
          sellPlaced++;
    }
 
@@ -549,7 +656,12 @@ void InitializeGrid()
       g_gridInitialized = true;
       Print("=== GRID INITIALIZED === Anchor=", g_anchorPrice,
             " Lot=", g_sessionLotSize,
-            " BuyStops=", buyPlaced, " SellStops=", sellPlaced);
+            " AbovePending=", buyPlaced, " BelowPending=", sellPlaced,
+            " Mode=", EnumToString(GridOrderMode));
+
+      // Initialize market order grid levels if enabled
+      if(EnableMarketOrderGrid)
+         InitializeMarketGridLevels();
    }
    else
    {
@@ -575,193 +687,214 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   // --- Replenish Buy Stops ---
+   ENUM_ORDER_TYPE aboveType = GetAbovePendingType();
+   ENUM_ORDER_TYPE belowType = GetBelowPendingType();
+
+   // --- Replenish above-anchor pending orders ---
    int missingBuys = GridOrders - buyStopCount;
    if(missingBuys > 0)
    {
-      double highestBuyStop = 0.0;
+      double highestAbove = 0.0;
       if(buyStopCount > 0)
-         highestBuyStop = buyStopOrders[buyStopCount - 1].price; // sorted ascending, last = highest
+         highestAbove = buyStopOrders[buyStopCount - 1].price; // sorted ascending, last = highest
       else
-         highestBuyStop = GetHighestPositionPrice(POSITION_TYPE_BUY);
+         highestAbove = GetHighestPositionPrice(POSITION_TYPE_BUY);
 
-      if(highestBuyStop <= 0.0)
-         highestBuyStop = ask + g_stopLevel * g_point;
+      if(highestAbove <= 0.0)
+         highestAbove = ask + g_stopLevel * g_point;
 
       int placed = 0;
       for(int i = 1; i <= missingBuys && placed < MAX_REPLENISH_PER_TICK; i++)
       {
          if(IsStopped()) return;
-         double newPrice = NormalizePrice(highestBuyStop + (i * GridSpacingPoints * g_point));
+         double newPrice = NormalizePrice(highestAbove + (i * GridSpacingPoints * g_point));
          if(newPrice > ask + g_stopLevel * g_point)
          {
-            if(PlacePendingOrder(ORDER_TYPE_BUY_STOP, newPrice, g_sessionLotSize))
+            if(PlacePendingOrder(aboveType, newPrice, g_sessionLotSize))
                placed++;
          }
       }
       if(missingBuys > MAX_REPLENISH_PER_TICK)
-         Print("ReplenishPendingOrders: ", missingBuys, " buy stops missing, placed ",
+         Print("ReplenishPendingOrders: ", missingBuys, " above-anchor pending missing, placed ",
                placed, " this tick (rate-limited).");
    }
 
-   // --- Replenish Sell Stops ---
+   // --- Replenish below-anchor pending orders ---
    int missingSells = GridOrders - sellStopCount;
    if(missingSells > 0)
    {
-      double lowestSellStop = DBL_MAX;
+      double lowestBelow = DBL_MAX;
       if(sellStopCount > 0)
-         lowestSellStop = sellStopOrders[0].price; // sorted ascending, first = lowest
+         lowestBelow = sellStopOrders[0].price; // sorted ascending, first = lowest
       else
-         lowestSellStop = GetLowestPositionPrice(POSITION_TYPE_SELL);
+         lowestBelow = GetLowestPositionPrice(POSITION_TYPE_SELL);
 
-      if(lowestSellStop == DBL_MAX || lowestSellStop <= 0.0)
-         lowestSellStop = bid - g_stopLevel * g_point;
+      if(lowestBelow == DBL_MAX || lowestBelow <= 0.0)
+         lowestBelow = bid - g_stopLevel * g_point;
 
       int placed = 0;
       for(int i = 1; i <= missingSells && placed < MAX_REPLENISH_PER_TICK; i++)
       {
          if(IsStopped()) return;
-         double newPrice = NormalizePrice(lowestSellStop - (i * GridSpacingPoints * g_point));
+         double newPrice = NormalizePrice(lowestBelow - (i * GridSpacingPoints * g_point));
          if(newPrice < bid - g_stopLevel * g_point)
          {
-            if(PlacePendingOrder(ORDER_TYPE_SELL_STOP, newPrice, g_sessionLotSize))
+            if(PlacePendingOrder(belowType, newPrice, g_sessionLotSize))
                placed++;
          }
       }
       if(missingSells > MAX_REPLENISH_PER_TICK)
-         Print("ReplenishPendingOrders: ", missingSells, " sell stops missing, placed ",
+         Print("ReplenishPendingOrders: ", missingSells, " below-anchor pending missing, placed ",
                placed, " this tick (rate-limited).");
    }
 }
 
 //+------------------------------------------------------------------+
-//| BASKET CLOSE: Triple-close mechanism (1 loser + 2 winners)        |
+//| BASKET CLOSE: Triple-close mechanism (1 largest loser + 2 largest|
+//| winners by profit magnitude, from opposite direction)            |
 //|                                                                    |
-//| Scenario A (price rising): lowestSell + lowest2Buys               |
-//| Scenario B (price falling): highestBuy + highest2Sells            |
-//|                                                                    |
-//| Migration happens BEFORE closing to capture exact prices.          |
+//| Selection logic (v4):                                             |
+//|  - Loser = position with most negative profit (any direction)     |
+//|  - Winners = 2 positions with highest positive profit, opposite   |
+//|    type of loser                                                   |
+//|  - Condition: winners combined profit > |loser loss| (net +ve)   |
+//|  - Migration happens BEFORE closing                               |
+//|  - Guarded by EnableTripleClose input                             |
 //+------------------------------------------------------------------+
 void TryBasketClose(SOrderInfo &buyPositions[],  SOrderInfo &sellPositions[],
                     int buyCount,                 int sellCount,
                     SOrderInfo &buyStopOrders[],  SOrderInfo &sellStopOrders[],
                     int buyStopCount,             int sellStopCount)
 {
-   double requiredProfit = PointsToMoney(GridSpacingPoints, g_sessionLotSize);
+   // Guard: skip if triple close is disabled
+   if(!EnableTripleClose) return;
 
-   // =========================================================
-   // SCENARIO A: Price is rising — BUYs winning, SELLs losing
-   // Close: lowest SELL (loser) + lowest 2 BUYs (winners)
-   // =========================================================
-   if(buyCount >= 2 && sellCount >= 1)
+   // ===================================================================
+   // STEP 1: Merge ALL positions into one combined array
+   // ===================================================================
+   int totalPos = buyCount + sellCount;
+   if(totalPos < 3) return; // Need at least 1 loser + 2 winners
+
+   SOrderInfo allPositions[];
+   ArrayResize(allPositions, totalPos);
+   int idx = 0;
+   for(int i = 0; i < buyCount;  i++) { allPositions[idx] = buyPositions[i];  idx++; }
+   for(int i = 0; i < sellCount; i++) { allPositions[idx] = sellPositions[i]; idx++; }
+
+   // ===================================================================
+   // STEP 2: Find the LARGEST LOSER (most negative profit)
+   // ===================================================================
+   int    loserIdx  = -1;
+   double worstLoss = 0.0;
+   for(int i = 0; i < totalPos; i++)
    {
-      SOrderInfo loserSell  = sellPositions[0];
-      SOrderInfo winnerBuy1 = buyPositions[0];
-      SOrderInfo winnerBuy2 = buyPositions[1];
-
-      double combinedProfit = loserSell.profit + winnerBuy1.profit + winnerBuy2.profit;
-
-      if(combinedProfit >= requiredProfit)
+      if(allPositions[i].profit < worstLoss)
       {
-         // Record the 3 closing prices BEFORE anything else
-         double closedPrice1 = loserSell.price;
-         double closedPrice2 = winnerBuy1.price;
-         double closedPrice3 = winnerBuy2.price;
+         worstLoss = allPositions[i].profit;
+         loserIdx  = i;
+      }
+   }
+   if(loserIdx == -1) return; // No losing position found
 
-         // Determine which Buy is MORE profitable for CloseBy
-         ulong closeByBuyTicket, normalCloseBuyTicket;
-         if(winnerBuy1.profit >= winnerBuy2.profit)
-         {
-            closeByBuyTicket     = winnerBuy1.ticket;
-            normalCloseBuyTicket = winnerBuy2.ticket;
-         }
-         else
-         {
-            closeByBuyTicket     = winnerBuy2.ticket;
-            normalCloseBuyTicket = winnerBuy1.ticket;
-         }
+   SOrderInfo loser    = allPositions[loserIdx];
+   int        loserType  = loser.type; // POSITION_TYPE_BUY or POSITION_TYPE_SELL
+   int        winnerType = (loserType == POSITION_TYPE_BUY) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
 
-         // === MIGRATE 3 farthest SELL STOP orders BEFORE closing ===
-         // Farthest sell stops = lowest prices (index 0, 1, 2)
-         if(sellStopCount >= 3)
-         {
-            ModifyPendingOrder(sellStopOrders[0].ticket, closedPrice1);
-            ModifyPendingOrder(sellStopOrders[1].ticket, closedPrice2);
-            ModifyPendingOrder(sellStopOrders[2].ticket, closedPrice3);
-         }
+   // ===================================================================
+   // STEP 3: Find the 2 LARGEST WINNERS (highest positive profit)
+   //         They must be the OPPOSITE type of the loser
+   // ===================================================================
+   int    winner1Idx   = -1, winner2Idx   = -1;
+   double bestProfit1  =  0.0, bestProfit2  =  0.0;
 
-         // === Execute Closes ===
-         // 1. CloseBy: most profitable Buy vs losing Sell (saves spread)
-         if(!trade.PositionCloseBy(closeByBuyTicket, loserSell.ticket))
-            Print("TryBasketClose A: PositionCloseBy failed — ",
-                  trade.ResultRetcodeDescription());
-         Sleep(200);
+   for(int i = 0; i < totalPos; i++)
+   {
+      if(i == loserIdx)                               continue;
+      if(allPositions[i].type   != winnerType)        continue;
+      if(allPositions[i].profit <= 0.0)               continue; // must be in profit
 
-         // 2. Normal close: the other Buy
-         if(!trade.PositionClose(normalCloseBuyTicket))
-            Print("TryBasketClose A: PositionClose failed — ",
-                  trade.ResultRetcodeDescription());
-
-         return;
+      if(allPositions[i].profit > bestProfit1)
+      {
+         bestProfit2 = bestProfit1; winner2Idx = winner1Idx;
+         bestProfit1 = allPositions[i].profit; winner1Idx = i;
+      }
+      else if(allPositions[i].profit > bestProfit2)
+      {
+         bestProfit2 = allPositions[i].profit; winner2Idx = i;
       }
    }
 
-   // =========================================================
-   // SCENARIO B: Price is falling — SELLs winning, BUYs losing
-   // Close: highest BUY (loser) + highest 2 SELLs (winners)
-   // =========================================================
-   if(sellCount >= 2 && buyCount >= 1)
+   // Need exactly 2 winners
+   if(winner1Idx == -1 || winner2Idx == -1) return;
+
+   SOrderInfo winner1 = allPositions[winner1Idx];
+   SOrderInfo winner2 = allPositions[winner2Idx];
+
+   // ===================================================================
+   // STEP 4: Condition — combined winners profit must exceed |loser loss|
+   // ===================================================================
+   double winnersProfit = winner1.profit + winner2.profit;
+   double loserLoss     = MathAbs(loser.profit);
+
+   if(winnersProfit <= loserLoss) return; // Not profitable enough (net would be negative)
+
+   // ===================================================================
+   // STEP 5: Record the 3 closing prices BEFORE closing
+   // ===================================================================
+   double closedPrice1 = loser.price;
+   double closedPrice2 = winner1.price;
+   double closedPrice3 = winner2.price;
+
+   // ===================================================================
+   // STEP 6: Migrate 3 farthest pending orders of the LOSER'S TYPE
+   //         to the 3 closed position prices (BEFORE closing)
+   // ===================================================================
+   if(loserType == POSITION_TYPE_BUY)
    {
-      SOrderInfo loserBuy    = buyPositions[buyCount - 1];
-      SOrderInfo winnerSell1 = sellPositions[sellCount - 1];
-      SOrderInfo winnerSell2 = sellPositions[sellCount - 2];
-
-      double combinedProfit = loserBuy.profit + winnerSell1.profit + winnerSell2.profit;
-
-      if(combinedProfit >= requiredProfit)
+      // Loser is BUY → migrate 3 farthest above-anchor (BUY STOP or BUY LIMIT) orders
+      // buyStopOrders sorted ASCENDING: last indices = highest = farthest
+      if(buyStopCount >= 3)
       {
-         // Record the 3 closing prices BEFORE anything else
-         double closedPrice1 = loserBuy.price;
-         double closedPrice2 = winnerSell1.price;
-         double closedPrice3 = winnerSell2.price;
-
-         // Determine which Sell is MORE profitable for CloseBy
-         ulong closeBySellTicket, normalCloseSellTicket;
-         if(winnerSell1.profit >= winnerSell2.profit)
-         {
-            closeBySellTicket     = winnerSell1.ticket;
-            normalCloseSellTicket = winnerSell2.ticket;
-         }
-         else
-         {
-            closeBySellTicket     = winnerSell2.ticket;
-            normalCloseSellTicket = winnerSell1.ticket;
-         }
-
-         // === MIGRATE 3 farthest BUY STOP orders BEFORE closing ===
-         // Farthest buy stops = highest prices (last 3 indices)
-         if(buyStopCount >= 3)
-         {
-            ModifyPendingOrder(buyStopOrders[buyStopCount - 1].ticket, closedPrice1);
-            ModifyPendingOrder(buyStopOrders[buyStopCount - 2].ticket, closedPrice2);
-            ModifyPendingOrder(buyStopOrders[buyStopCount - 3].ticket, closedPrice3);
-         }
-
-         // === Execute Closes ===
-         // 1. CloseBy: most profitable Sell vs losing Buy
-         if(!trade.PositionCloseBy(closeBySellTicket, loserBuy.ticket))
-            Print("TryBasketClose B: PositionCloseBy failed — ",
-                  trade.ResultRetcodeDescription());
-         Sleep(200);
-
-         // 2. Normal close: the other Sell
-         if(!trade.PositionClose(normalCloseSellTicket))
-            Print("TryBasketClose B: PositionClose failed — ",
-                  trade.ResultRetcodeDescription());
-
-         return;
+         ModifyPendingOrder(buyStopOrders[buyStopCount - 1].ticket, closedPrice1);
+         ModifyPendingOrder(buyStopOrders[buyStopCount - 2].ticket, closedPrice2);
+         ModifyPendingOrder(buyStopOrders[buyStopCount - 3].ticket, closedPrice3);
       }
    }
+   else
+   {
+      // Loser is SELL → migrate 3 farthest below-anchor (SELL STOP or SELL LIMIT) orders
+      // sellStopOrders sorted ASCENDING: index 0 = lowest = farthest when price is up
+      if(sellStopCount >= 3)
+      {
+         ModifyPendingOrder(sellStopOrders[0].ticket, closedPrice1);
+         ModifyPendingOrder(sellStopOrders[1].ticket, closedPrice2);
+         ModifyPendingOrder(sellStopOrders[2].ticket, closedPrice3);
+      }
+   }
+
+   // ===================================================================
+   // STEP 7: Execute closes
+   //         CloseBy: MOST profitable winner vs loser (saves spread)
+   //         Normal close: other winner
+   // ===================================================================
+   ulong closeByWinnerTicket, normalCloseWinnerTicket;
+   if(winner1.profit >= winner2.profit)
+   {
+      closeByWinnerTicket    = winner1.ticket;
+      normalCloseWinnerTicket = winner2.ticket;
+   }
+   else
+   {
+      closeByWinnerTicket    = winner2.ticket;
+      normalCloseWinnerTicket = winner1.ticket;
+   }
+
+   if(!trade.PositionCloseBy(closeByWinnerTicket, loser.ticket))
+      Print("TryBasketClose: PositionCloseBy failed — ", trade.ResultRetcodeDescription());
+   Sleep(200);
+
+   if(!trade.PositionClose(normalCloseWinnerTicket))
+      Print("TryBasketClose: PositionClose failed — ", trade.ResultRetcodeDescription());
 }
 
 //+------------------------------------------------------------------+
@@ -793,10 +926,14 @@ void CloseIndividualProfitable(SOrderInfo &positions[], int count,
 //+------------------------------------------------------------------+
 //| GAP-FILLING MIGRATION: Move farthest opposite pendings into gap   |
 //|                                                                    |
-//| UP direction: Only BUY positions exist, move farthest Sell Stops  |
-//|               to fill gap between market and lowest Buy Stop       |
-//| DOWN direction: Only SELL positions exist, move farthest Buy Stops |
-//|               to fill gap between market and highest Sell Stop     |
+//| UP direction: Only BUY positions exist, move farthest below-      |
+//|               anchor pendings to fill gap (with range validation) |
+//| DOWN direction: Only SELL positions exist, move farthest above-   |
+//|               anchor pendings to fill gap (with range validation) |
+//|                                                                    |
+//| RANGE VALIDATION (v4): target price must fall BETWEEN:            |
+//|  - highest SELL position or Sell Stop price (lower boundary)      |
+//|  - lowest BUY position or Buy Stop price   (upper boundary)       |
 //+------------------------------------------------------------------+
 void MigrateToFillGaps(int direction,
                         SOrderInfo &marketPositions[], int posCount,
@@ -808,12 +945,16 @@ void MigrateToFillGaps(int direction,
       // Only BUY positions exist, price is going up
       if(sellStopCount == 0 || posCount == 0 || buyStopCount == 0) return;
 
-      double lowestBuyPos   = marketPositions[0].price;                      // lowest buy position
-      double lowestBuyStop  = buyStopOrders[0].price;                        // lowest buy stop
+      double lowestBuyPos    = marketPositions[0].price;                     // lowest buy position
+      double lowestBuyStop   = buyStopOrders[0].price;                       // lowest buy stop
       double highestSellStop = sellStopOrders[sellStopCount - 1].price;      // highest sell stop
 
-      double gapBottom = highestSellStop;
-      double gapTop    = MathMin(lowestBuyPos, lowestBuyStop);
+      // Define valid range boundaries
+      double rangeUpperBound = MathMin(lowestBuyPos, lowestBuyStop); // lowest BUY or Buy Stop
+      double rangeLowerBound = highestSellStop;                       // highest Sell Stop
+
+      double gapTop    = rangeUpperBound;
+      double gapBottom = rangeLowerBound;
 
       // No real gap to fill
       if(gapTop - gapBottom <= GridSpacingPoints * g_point * 2.0) return;
@@ -827,6 +968,9 @@ void MigrateToFillGaps(int direction,
       for(int i = 0; i < ordersToMove; i++)
       {
          double targetPrice = NormalizePrice(gapTop - ((i + 1) * GridSpacingPoints * g_point));
+
+         // RANGE CHECK: ensure target is within valid range
+         if(targetPrice <= rangeLowerBound || targetPrice >= rangeUpperBound) continue;
 
          if(targetPrice < bid - g_stopLevel * g_point)
          {
@@ -844,8 +988,12 @@ void MigrateToFillGaps(int direction,
       double highestSellStop = sellStopOrders[sellStopCount - 1].price;      // highest sell stop
       double lowestBuyStop   = buyStopOrders[0].price;                       // lowest buy stop
 
-      double gapBottom = MathMax(highestSellPos, highestSellStop);
-      double gapTop    = lowestBuyStop;
+      // Define valid range boundaries
+      double rangeLowerBound = MathMax(highestSellPos, highestSellStop); // highest SELL or Sell Stop
+      double rangeUpperBound = lowestBuyStop;                            // lowest Buy Stop
+
+      double gapBottom = rangeLowerBound;
+      double gapTop    = rangeUpperBound;
 
       if(gapTop - gapBottom <= GridSpacingPoints * g_point * 2.0) return;
 
@@ -859,6 +1007,9 @@ void MigrateToFillGaps(int direction,
       {
          int    idx         = buyStopCount - 1 - i;  // start from highest buy stop
          double targetPrice = NormalizePrice(gapBottom + ((i + 1) * GridSpacingPoints * g_point));
+
+         // RANGE CHECK: ensure target is within valid range
+         if(targetPrice <= rangeLowerBound || targetPrice >= rangeUpperBound) continue;
 
          if(targetPrice > ask + g_stopLevel * g_point)
          {
@@ -930,11 +1081,135 @@ void ExecuteFullClose(SOrderInfo &buyPositions[], SOrderInfo &sellPositions[],
    CloseAllRemainingPositions();
 
    // === STEP 5: Reset state ===
-   g_gridInitialized = false;
-   g_anchorPrice     = 0.0;
-   g_sessionLotSize  = 0.0;
+   g_gridInitialized     = false;
+   g_anchorPrice         = 0.0;
+   g_sessionLotSize      = 0.0;
+   g_marketGridLevelCount = 0;
+   g_marketGridStartPrice = 0.0;
+   ArrayResize(g_marketGridLevels,     0);
+   ArrayResize(g_marketGridDirections, 0);
 
    Print("=== CYCLE COMPLETE === Profit target reached. Restarting grid...");
+}
+
+//+------------------------------------------------------------------+
+//| MARKET GRID: Initialize price-level arrays above and below start  |
+//+------------------------------------------------------------------+
+void InitializeMarketGridLevels()
+{
+   // Determine starting price
+   if(MarketGridStartPrice > 0)
+      g_marketGridStartPrice = NormalizeDouble(MarketGridStartPrice, g_digits);
+   else
+   {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      g_marketGridStartPrice = NormalizeDouble((ask + bid) / 2.0, g_digits);
+   }
+
+   double spacing   = GridSpacingPoints * g_point;
+   int totalLevels  = GridOrders * 2; // GridOrders above + GridOrders below
+
+   ArrayResize(g_marketGridLevels,     totalLevels);
+   ArrayResize(g_marketGridDirections, totalLevels);
+   g_marketGridLevelCount = totalLevels;
+
+   int idx = 0;
+
+   // Levels ABOVE starting price
+   for(int i = 1; i <= GridOrders; i++)
+   {
+      double level = NormalizeDouble(g_marketGridStartPrice + (i * spacing), g_digits);
+      g_marketGridLevels[idx]     = level;
+      g_marketGridDirections[idx] = (MarketGridAboveDir == MARKET_GRID_BUY_ABOVE) ? 0 : 1; // 0=BUY, 1=SELL
+      idx++;
+   }
+
+   // Levels BELOW starting price
+   for(int i = 1; i <= GridOrders; i++)
+   {
+      double level = NormalizeDouble(g_marketGridStartPrice - (i * spacing), g_digits);
+      g_marketGridLevels[idx]     = level;
+      g_marketGridDirections[idx] = (MarketGridAboveDir == MARKET_GRID_BUY_ABOVE) ? 1 : 0; // opposite of above
+      idx++;
+   }
+
+   Print("=== MARKET GRID INITIALIZED === Start=", g_marketGridStartPrice,
+         " Levels=", g_marketGridLevelCount, " Spacing=", GridSpacingPoints, "pts");
+}
+
+//+------------------------------------------------------------------+
+//| MARKET GRID: Remove a triggered level from the array (one-shot)  |
+//+------------------------------------------------------------------+
+void RemoveMarketGridLevel(int index)
+{
+   if(index < 0 || index >= g_marketGridLevelCount) return;
+
+   // Shift all elements after 'index' one position to the left
+   for(int j = index; j < g_marketGridLevelCount - 1; j++)
+   {
+      g_marketGridLevels[j]     = g_marketGridLevels[j + 1];
+      g_marketGridDirections[j] = g_marketGridDirections[j + 1];
+   }
+
+   g_marketGridLevelCount--;
+   ArrayResize(g_marketGridLevels,     g_marketGridLevelCount);
+   ArrayResize(g_marketGridDirections, g_marketGridLevelCount);
+}
+
+//+------------------------------------------------------------------+
+//| MARKET GRID: Check price crossings and open market orders        |
+//+------------------------------------------------------------------+
+void ProcessMarketGridLevels()
+{
+   if(!EnableMarketOrderGrid)          return;
+   if(g_marketGridLevelCount <= 0)     return;
+   if(IsStopped())                     return;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))           return;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   // Scan in reverse for safe removal during iteration
+   for(int i = g_marketGridLevelCount - 1; i >= 0; i--)
+   {
+      double level    = g_marketGridLevels[i];
+      bool triggered  = false;
+
+      // Levels ABOVE start: triggered when Ask >= level
+      // Levels BELOW start: triggered when Bid <= level
+      if(level > g_marketGridStartPrice)
+      {
+         if(ask >= level) triggered = true;
+      }
+      else
+      {
+         if(bid <= level) triggered = true;
+      }
+
+      if(triggered)
+      {
+         if(g_marketGridDirections[i] == 0) // BUY
+         {
+            if(!trade.Buy(g_sessionLotSize, _Symbol, 0, 0, 0,
+                          "MarketGrid BUY at " + DoubleToString(level, g_digits)))
+               Print("MarketGrid BUY failed — ", trade.ResultRetcodeDescription());
+            else
+               Print("MarketGrid: BUY triggered at level ", level);
+         }
+         else // SELL
+         {
+            if(!trade.Sell(g_sessionLotSize, _Symbol, 0, 0, 0,
+                           "MarketGrid SELL at " + DoubleToString(level, g_digits)))
+               Print("MarketGrid SELL failed — ", trade.ResultRetcodeDescription());
+            else
+               Print("MarketGrid: SELL triggered at level ", level);
+         }
+
+         RemoveMarketGridLevel(i); // One-shot: remove level after triggering
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1004,8 +1279,11 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
    info += " MARKET\n";
    info += "   Bid: " + DoubleToString(bid, g_digits) + "  Ask: " + DoubleToString(ask, g_digits) + "\n";
    info += "   Spread: " + IntegerToString(spread) + " pts\n";
-   info += "   Migration: " + (EnableMigration ? "ON" : "OFF") + "\n";
-   info += "   Connection: " + (connected ? "OK" : "LOST") + "\n";
+   info += "   Migration:   " + (EnableMigration ? "ON" : "OFF") + "\n";
+   info += "   TripleClose: " + (EnableTripleClose ? "ON" : "OFF") + "\n";
+   info += "   GridMode:    " + EnumToString(GridOrderMode) + "\n";
+   info += "   MktGrid:     " + (EnableMarketOrderGrid ? "ON (" + IntegerToString(g_marketGridLevelCount) + " levels)" : "OFF") + "\n";
+   info += "   Connection:  " + (connected ? "OK" : "LOST") + "\n";
    info += "========================================\n";
 
    Comment(info);
@@ -1289,6 +1567,11 @@ void OnTick()
    if(EnableMigration && sellCount > 0 && buyCount == 0)
       MigrateToFillGaps(DIRECTION_DOWN, sellPositions, sellCount,
                         buyStopOrders, buyStopCount, sellStopOrders, sellStopCount);
+
+   // ============================================================
+   // STEP 8.5: Market Order Grid — check price-level crossings
+   // ============================================================
+   ProcessMarketGridLevels();
 
    // ============================================================
    // STEP 8: Update chart display
