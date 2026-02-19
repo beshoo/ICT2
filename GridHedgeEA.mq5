@@ -24,6 +24,11 @@ input double   MinLot             = 0.01;    // Minimum lot size
 input double   TotalProfitPercent = 1.0;     // % of account balance to trigger full close & restart
 input bool     EnableMigration    = true;    // Enable/disable gap-filling migration feature
 
+//=== Market Close Protection ===
+input bool     UseMarketCloseProtection = true;  // Enable market close protection before session end
+input int      HoursBeforeClose         = 2;     // Hours before market close to stop new orders
+input int      TradingStartHour         = 1;     // Server hour to auto-restart grid next trading day
+
 //=== Triple Close Settings ===
 input bool     EnableTripleClose  = true;    // Enable/disable triple close basket mechanism
 
@@ -57,9 +62,11 @@ CPositionInfo  posInfo;
 COrderInfo     ordInfo;
 
 //=== Anchor & Session State ===
-double g_anchorPrice     = 0.0;
-double g_sessionLotSize  = 0.0;
-bool   g_gridInitialized = false;
+double g_anchorPrice      = 0.0;
+double g_sessionLotSize   = 0.0;
+bool   g_gridInitialized  = false;
+bool   g_marketCloseMode  = false;  // True when in market close protection mode
+bool   g_waitingForNewDay = false;  // True when grid is closed, waiting for next day restart
 
 //=== Cached Symbol Properties ===
 double g_point;
@@ -393,10 +400,10 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
          spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
          effectiveStopPts = MathMax(g_stopLevel, spread) + 10;
 
-         if(orderType == ORDER_TYPE_BUY_STOP)
-            price = NormalizePrice(ask + effectiveStopPts * g_point);
+         if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_LIMIT)
+            price = NormalizePrice(ask + effectiveStopPts * g_point);  // must be above Ask
          else
-            price = NormalizePrice(bid - effectiveStopPts * g_point);
+            price = NormalizePrice(bid - effectiveStopPts * g_point);  // must be below Bid
       }
       else if(error == TRADE_RETCODE_NO_MONEY)
       {
@@ -624,10 +631,10 @@ void InitializeGrid()
       // --- Place above-anchor order i ---
       ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double abovePrice = NormalizePrice(g_anchorPrice + halfSpread + (i * GridSpacingPoints * g_point));
-      if(aboveType == ORDER_TYPE_BUY_STOP && abovePrice <= ask)
-         abovePrice = NormalizePrice(ask + MathMax(g_stopLevel, 1) * g_point);
-      else if(aboveType == ORDER_TYPE_SELL_LIMIT && abovePrice <= ask)
-         abovePrice = NormalizePrice(ask + MathMax(g_stopLevel, 1) * g_point);
+      if((aboveType == ORDER_TYPE_BUY_STOP || aboveType == ORDER_TYPE_SELL_LIMIT) && abovePrice <= ask)
+      {
+         abovePrice = NormalizePrice(ask + MathMax(g_stopLevel, spreadPoints) * g_point);
+      }
       if(PlacePendingOrder(aboveType, abovePrice, g_sessionLotSize))
          buyPlaced++;
 
@@ -635,15 +642,14 @@ void InitializeGrid()
 
       // --- Place below-anchor order i ---
       bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      int curSpread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
       double belowPrice = NormalizePrice(g_anchorPrice - halfSpread - (i * GridSpacingPoints * g_point));
       if(belowType == ORDER_TYPE_SELL_STOP && belowPrice >= bid)
       {
-         int curSpread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
          belowPrice = NormalizePrice(bid - MathMax(g_stopLevel, curSpread) * g_point - g_point);
       }
       else if(belowType == ORDER_TYPE_BUY_LIMIT && belowPrice >= bid)
       {
-         int curSpread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
          belowPrice = NormalizePrice(bid - MathMax(g_stopLevel, curSpread) * g_point - g_point);
       }
       if(PlacePendingOrder(belowType, belowPrice, g_sessionLotSize))
@@ -698,7 +704,12 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
       if(buyStopCount > 0)
          highestAbove = buyStopOrders[buyStopCount - 1].price; // sorted ascending, last = highest
       else
-         highestAbove = GetHighestPositionPrice(POSITION_TYPE_BUY);
+      {
+         // Fallback: find highest position of the TYPE created by above-anchor orders
+         // Stop mode: Buy Stop → BUY positions  |  Limit mode: Sell Limit → SELL positions
+         int aboveFallbackPosType = (GridOrderMode == MODE_LIMIT_ORDERS) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+         highestAbove = GetHighestPositionPrice(aboveFallbackPosType);
+      }
 
       if(highestAbove <= 0.0)
          highestAbove = ask + g_stopLevel * g_point;
@@ -727,7 +738,12 @@ void ReplenishPendingOrders(SOrderInfo &buyStopOrders[], SOrderInfo &sellStopOrd
       if(sellStopCount > 0)
          lowestBelow = sellStopOrders[0].price; // sorted ascending, first = lowest
       else
-         lowestBelow = GetLowestPositionPrice(POSITION_TYPE_SELL);
+      {
+         // Fallback: find lowest position of the TYPE created by below-anchor orders
+         // Stop mode: Sell Stop → SELL positions  |  Limit mode: Buy Limit → BUY positions
+         int belowFallbackPosType = (GridOrderMode == MODE_LIMIT_ORDERS) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+         lowestBelow = GetLowestPositionPrice(belowFallbackPosType);
+      }
 
       if(lowestBelow == DBL_MAX || lowestBelow <= 0.0)
          lowestBelow = bid - g_stopLevel * g_point;
@@ -849,10 +865,18 @@ void TryBasketClose(SOrderInfo &buyPositions[],  SOrderInfo &sellPositions[],
    // STEP 6: Migrate 3 farthest pending orders of the LOSER'S TYPE
    //         to the 3 closed position prices (BEFORE closing)
    // ===================================================================
-   if(loserType == POSITION_TYPE_BUY)
+   // Determine which pending order array corresponds to the loser's position type:
+   // Stop mode:  BUY loser → Buy Stops (above-anchor) | SELL loser → Sell Stops (below-anchor)
+   // Limit mode: BUY loser → Buy Limits (below-anchor) | SELL loser → Sell Limits (above-anchor)
+   bool migrateFromAbove;
+   if(GridOrderMode == MODE_STOP_ORDERS)
+      migrateFromAbove = (loserType == POSITION_TYPE_BUY);
+   else
+      migrateFromAbove = (loserType == POSITION_TYPE_SELL);
+
+   if(migrateFromAbove)
    {
-      // Loser is BUY → migrate 3 farthest above-anchor (BUY STOP or BUY LIMIT) orders
-      // buyStopOrders sorted ASCENDING: last indices = highest = farthest
+      // Migrate 3 farthest above-anchor orders (highest prices = last indices)
       if(buyStopCount >= 3)
       {
          ModifyPendingOrder(buyStopOrders[buyStopCount - 1].ticket, closedPrice1);
@@ -862,8 +886,7 @@ void TryBasketClose(SOrderInfo &buyPositions[],  SOrderInfo &sellPositions[],
    }
    else
    {
-      // Loser is SELL → migrate 3 farthest below-anchor (SELL STOP or SELL LIMIT) orders
-      // sellStopOrders sorted ASCENDING: index 0 = lowest = farthest when price is up
+      // Migrate 3 farthest below-anchor orders (lowest prices = first indices)
       if(sellStopCount >= 3)
       {
          ModifyPendingOrder(sellStopOrders[0].ticket, closedPrice1);
@@ -1213,6 +1236,70 @@ void ProcessMarketGridLevels()
 }
 
 //+------------------------------------------------------------------+
+//| MARKET CLOSE PROTECTION: Check if within HoursBeforeClose of     |
+//| session end. Uses SymbolInfoSessionTrade for the actual session   |
+//| end time so it works on any broker/symbol.                        |
+//+------------------------------------------------------------------+
+bool IsMarketCloseProtectionTime()
+{
+   if(!UseMarketCloseProtection) return false;
+
+   datetime serverTime = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(serverTime, dt);
+
+   // Try to get the session end time for today's day-of-week
+   datetime sessionStart = 0, sessionEnd = 0;
+   bool hasSession = SymbolInfoSessionTrade(_Symbol,
+                        (ENUM_DAY_OF_WEEK)dt.day_of_week, 0,
+                        sessionStart, sessionEnd);
+
+   if(!hasSession || sessionEnd == 0)
+   {
+      // Fallback: treat 23:55 server time as close time
+      MqlDateTime dtFallback;
+      TimeToStruct(serverTime, dtFallback);
+      int currentMinutes = dtFallback.hour * 60 + dtFallback.min;
+      int closeMinutes   = 23 * 60 + 55;
+      int minutesLeft    = closeMinutes - currentMinutes;
+      if(minutesLeft < 0) minutesLeft += 24 * 60;
+      return (minutesLeft <= HoursBeforeClose * 60);
+   }
+
+   // sessionEnd from SymbolInfoSessionTrade is seconds-from-midnight
+   // Convert to comparable minutes-from-midnight
+   MqlDateTime dtEnd;
+   TimeToStruct(sessionEnd, dtEnd);
+
+   int currentMinutes = dt.hour  * 60 + dt.min;
+   int closeMinutes   = dtEnd.hour * 60 + dtEnd.min;
+   int minutesLeft    = closeMinutes - currentMinutes;
+
+   // Handle day wrap-around (e.g. session ends at 00:00)
+   if(minutesLeft < 0) minutesLeft += 24 * 60;
+
+   return (minutesLeft <= HoursBeforeClose * 60 && minutesLeft >= 0);
+}
+
+//+------------------------------------------------------------------+
+//| MARKET CLOSE PROTECTION: Check if it is now a new trading day    |
+//| (current server hour == TradingStartHour and market is open).    |
+//+------------------------------------------------------------------+
+bool IsNewTradingDay()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+
+   if(dt.hour == TradingStartHour)
+   {
+      // Verify the market is actually open (non-zero Ask)
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      if(ask > 0.0) return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
 //| CHART DISPLAY: Update the chart comment panel                     |
 //+------------------------------------------------------------------+
 void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStopCount,
@@ -1247,7 +1334,7 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
 
    string info = "";
    info += "========================================\n";
-   info += "       GRID HEDGE EA v2.0\n";
+   info += "       GRID HEDGE EA v4.0\n";
    info += "========================================\n";
    info += " Anchor:     " + DoubleToString(g_anchorPrice, g_digits) + "\n";
    info += " Session Lot: " + DoubleToString(g_sessionLotSize, 2) + "\n";
@@ -1257,8 +1344,8 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
    info += "   BUY:  " + IntegerToString(buyCount) + "    SELL: " + IntegerToString(sellCount) + "\n";
    info += "   Total: " + IntegerToString(buyCount + sellCount) + "\n";
    info += " PENDING\n";
-   info += "   Buy Stops:  " + IntegerToString(buyStopCount) + " / " + IntegerToString(GridOrders) + "\n";
-   info += "   Sell Stops: " + IntegerToString(sellStopCount) + " / " + IntegerToString(GridOrders) + "\n";
+   info += "   Above:  " + IntegerToString(buyStopCount) + " / " + IntegerToString(GridOrders) + "\n";
+   info += "   Below:  " + IntegerToString(sellStopCount) + " / " + IntegerToString(GridOrders) + "\n";
    info += "----------------------------------------\n";
    info += " TRADE STATS\n";
    info += "   Winning:  " + IntegerToString(winCount) + "  ($" + DoubleToString(winTotal, 2) + ")\n";
@@ -1283,6 +1370,8 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
    info += "   TripleClose: " + (EnableTripleClose ? "ON" : "OFF") + "\n";
    info += "   GridMode:    " + EnumToString(GridOrderMode) + "\n";
    info += "   MktGrid:     " + (EnableMarketOrderGrid ? "ON (" + IntegerToString(g_marketGridLevelCount) + " levels)" : "OFF") + "\n";
+   info += "   MktClose:    " + (UseMarketCloseProtection ? (g_marketCloseMode ? "ACTIVE" : "Armed (" + IntegerToString(HoursBeforeClose) + "h)") : "OFF") + "\n";
+   info += "   NewDayWait:  " + (g_waitingForNewDay ? ("YES (restart at " + IntegerToString(TradingStartHour) + ":00)") : "No") + "\n";
    info += "   Connection:  " + (connected ? "OK" : "LOST") + "\n";
    info += "========================================\n";
 
@@ -1406,6 +1495,98 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   // 3b. SPREAD vs SPACING WARNING
+   // Calculate the three meaningful thresholds based on the CURRENT live spread:
+   //   minimum_safe      = spread + 1            (orders won't trigger from spread noise)
+   //   recommended       = spread * 2            (positions can profit beyond spread cost)
+   //   triple_close_ready= ceil(spread * 1.5) * 2 (triple-close condition fires reliably:
+   //                        2*spacing > 3*spread  →  spacing > 1.5*spread)
+   {
+      int currentSpread       = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+      int minimumSafe         = currentSpread + 1;
+      int recommended         = currentSpread * 2;
+      int tripleCloseReady    = (int)MathCeil(currentSpread * 1.5) * 2 / 2; // = ceil(1.5 * spread)
+
+      // Convert to price distance for display (easier for user to understand on chart)
+      double minSafePrice     = minimumSafe      * g_point;
+      double recommendedPrice = recommended      * g_point;
+      double tripleReadyPrice = tripleCloseReady * g_point;
+
+      if((int)GridSpacingPoints <= currentSpread)
+      {
+         // CRITICAL: spacing is inside or equal to the spread — EA will not work correctly
+         string warnMsg = StringFormat(
+            "GridHedgeEA CRITICAL WARNING\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Your GridSpacingPoints = %d pts  (%.%df %s)\n"
+            "Current spread         = %d pts  (%.%df %s)\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Your spacing is INSIDE the spread — the EA will malfunction:\n"
+            "  • Orders trigger instantly upon placement\n"
+            "  • Triple-close profit condition can NEVER be satisfied\n"
+            "  • Endless replenishment loop\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CALCULATED MINIMUMS FOR %s (spread=%d pts):\n"
+            "  Absolute minimum  → %d pts  (%.%df %s)  — orders stop triggering from spread\n"
+            "  Recommended       → %d pts  (%.%df %s)  — positions can profit above spread cost\n"
+            "  Triple-close ready→ %d pts  (%.%df %s)  — triple-close fires reliably\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Please restart the EA with GridSpacingPoints >= %d pts",
+            (int)GridSpacingPoints, minSafePrice,     g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            currentSpread,          minSafePrice,     g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            _Symbol, currentSpread,
+            minimumSafe,      minSafePrice,     g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            recommended,      recommendedPrice, g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            tripleCloseReady, tripleReadyPrice, g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            recommended);
+         Alert(warnMsg);
+         Print(warnMsg);
+      }
+      else if((int)GridSpacingPoints < tripleCloseReady)
+      {
+         // WARNING: spacing is above spread but below triple-close threshold
+         string warnMsg = StringFormat(
+            "GridHedgeEA WARNING\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Your GridSpacingPoints = %d pts  (%.%df %s)\n"
+            "Current spread         = %d pts  (%.%df %s)\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Your spacing may be too small for reliable operation.\n"
+            "CALCULATED MINIMUMS FOR %s (spread=%d pts):\n"
+            "  Absolute minimum  → %d pts  (%.%df %s)  %s\n"
+            "  Recommended       → %d pts  (%.%df %s)  %s\n"
+            "  Triple-close ready→ %d pts  (%.%df %s)  %s\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Consider restarting with GridSpacingPoints = %d pts",
+            (int)GridSpacingPoints, (double)(int)GridSpacingPoints * g_point, g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            currentSpread,          (double)currentSpread * g_point,          g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            _Symbol, currentSpread,
+            minimumSafe,      minSafePrice,     g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            ((int)GridSpacingPoints >= minimumSafe)      ? "[OK - you passed this]" : "[NOT MET]",
+            recommended,      recommendedPrice, g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            ((int)GridSpacingPoints >= recommended)      ? "[OK - you passed this]" : "[NOT MET]",
+            tripleCloseReady, tripleReadyPrice, g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            ((int)GridSpacingPoints >= tripleCloseReady) ? "[OK - you passed this]" : "[NOT MET]",
+            tripleCloseReady);
+         Alert(warnMsg);
+         Print(warnMsg);
+      }
+      else
+      {
+         // All good — log the confirmed thresholds for reference
+         Print(StringFormat(
+            "GridHedgeEA: Spread check PASSED\n"
+            "  GridSpacingPoints  = %d pts  (%.%df %s)\n"
+            "  Current spread     = %d pts  (%.%df %s)\n"
+            "  Ratio              = %.1fx the spread\n"
+            "  Absolute minimum   = %d pts  | Recommended = %d pts  | Triple-close ready = %d pts",
+            (int)GridSpacingPoints, (double)(int)GridSpacingPoints * g_point, g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            currentSpread,          (double)currentSpread * g_point,          g_digits, AccountInfoString(ACCOUNT_CURRENCY),
+            (double)GridSpacingPoints / MathMax(currentSpread, 1),
+            minimumSafe, recommended, tripleCloseReady));
+      }
+   }
+
    // 4. Check for existing EA orders/positions (for restart recovery)
    bool hasExisting = false;
 
@@ -1440,6 +1621,17 @@ int OnInit()
    {
       Print("GridHedgeEA: Existing grid detected — recovering session.");
       g_gridInitialized = true;
+
+      // Restore market close protection state that was saved on last OnDeinit
+      if(GlobalVariableCheck("GridEA_MarketCloseMode"))
+         g_marketCloseMode  = (bool)GlobalVariableGet("GridEA_MarketCloseMode");
+      if(GlobalVariableCheck("GridEA_WaitingForNewDay"))
+         g_waitingForNewDay = (bool)GlobalVariableGet("GridEA_WaitingForNewDay");
+
+      if(g_marketCloseMode)
+         Print("GridHedgeEA: Recovered in MARKET CLOSE PROTECTION mode.");
+      if(g_waitingForNewDay)
+         Print("GridHedgeEA: Recovered in WAITING FOR NEW DAY mode. Will restart at hour ", TradingStartHour, ".");
 
       // Recover lot size from an existing order/position
       for(int i = 0; i < OrdersTotal(); i++)
@@ -1482,7 +1674,18 @@ int OnInit()
    }
    else
    {
-      InitializeGrid();
+      // Check if we're already inside a market close protection window
+      // If so, don't start a fresh grid — just wait for the new day instead
+      if(UseMarketCloseProtection && IsMarketCloseProtectionTime())
+      {
+         Print("GridHedgeEA: Started during market close protection window. Waiting for new trading day.");
+         g_marketCloseMode  = true;
+         g_waitingForNewDay = true;
+      }
+      else
+      {
+         InitializeGrid();
+      }
    }
 
    // 5. Create the Close All button on the chart
@@ -1496,11 +1699,28 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if(!g_gridInitialized) return;
-
    // Skip all trading logic when AutoTrading is disabled or no connection
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
    if(!TerminalInfoInteger(TERMINAL_CONNECTED)) return;
+
+   // ============================================================
+   // STEP 0: Waiting for new trading day after market close protection
+   // ============================================================
+   if(g_waitingForNewDay)
+   {
+      if(IsNewTradingDay())
+      {
+         Print("GridHedgeEA: New trading day detected at hour ", TradingStartHour, " — restarting grid.");
+         g_waitingForNewDay = false;
+         g_marketCloseMode  = false;
+         InitializeGrid();
+      }
+      // Keep chart updated while waiting
+      UpdateChartInfo(0, 0, 0, 0, 0.0, 0.0);
+      return;
+   }
+
+   if(!g_gridInitialized) return;
 
    // --- Collect positions and pending orders ---
    SOrderInfo buyPositions[], sellPositions[];
@@ -1513,9 +1733,60 @@ void OnTick()
    int sellCount     = ArraySize(sellPositions);
    int buyStopCount  = ArraySize(buyStopOrders);
    int sellStopCount = ArraySize(sellStopOrders);
+   int totalPositions = buyCount + sellCount;
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // ============================================================
+   // STEP 1: Activate market close protection if time has come
+   // ============================================================
+   if(UseMarketCloseProtection && !g_marketCloseMode)
+   {
+      if(IsMarketCloseProtectionTime())
+      {
+         g_marketCloseMode = true;
+         Print("=== MARKET CLOSE PROTECTION ACTIVATED === No new orders. Monitoring for breakeven.");
+      }
+   }
+
+   // ============================================================
+   // STEP 2: Market close protection mode logic
+   // ============================================================
+   if(g_marketCloseMode)
+   {
+      // No new orders, no replenishment, no migration — only monitor P/L
+
+      if(totalPositions == 0)
+      {
+         // Nothing open — clean up and wait for new day
+         Print("MarketCloseProtection: No positions open. Deleting pending orders and waiting for new day.");
+         DeleteAllPendingOrders();
+         g_gridInitialized = false;
+         g_waitingForNewDay = true;
+         UpdateChartInfo(0, 0, 0, 0, 0.0, 0.0);
+         return;
+      }
+
+      double totalProfit = CalculateTotalFloatingProfit();
+
+      if(totalProfit >= 0.0)
+      {
+         // Break-even or better reached — close everything and wait for new day
+         Print("MarketCloseProtection: P/L = $", DoubleToString(totalProfit, 2),
+               " >= 0. Closing all positions and waiting for new day.");
+         ExecuteFullClose(buyPositions, sellPositions, buyCount, sellCount);
+         DeleteAllPendingOrders();
+         g_gridInitialized  = false;
+         g_waitingForNewDay = true;
+         UpdateChartInfo(0, 0, 0, 0, totalProfit, 0.0);
+         return;
+      }
+
+      // Still in loss — keep monitoring, do nothing else this tick
+      UpdateChartInfo(buyCount, sellCount, buyStopCount, sellStopCount, totalProfit, 0.0);
+      return;
+   }
 
    // ============================================================
    // STEP 3: Check total profit target
@@ -1523,7 +1794,7 @@ void OnTick()
    double totalProfit  = CalculateTotalFloatingProfit();
    double targetProfit = AccountInfoDouble(ACCOUNT_BALANCE) * TotalProfitPercent / 100.0;
 
-   if(totalProfit >= targetProfit && (buyCount > 0 || sellCount > 0))
+   if(totalProfit >= targetProfit && totalPositions > 0)
    {
       ExecuteFullClose(buyPositions, sellPositions, buyCount, sellCount);
       Sleep(2000);
@@ -1541,6 +1812,11 @@ void OnTick()
    // ============================================================
    if(buyCount > 0 && sellCount > 0)
    {
+      // Re-collect pending orders after replenishment (they may have changed)
+      CollectAndSortPendingOrders(buyStopOrders, sellStopOrders);
+      buyStopCount  = ArraySize(buyStopOrders);
+      sellStopCount = ArraySize(sellStopOrders);
+
       TryBasketClose(buyPositions, sellPositions, buyCount, sellCount,
                      buyStopOrders, sellStopOrders, buyStopCount, sellStopCount);
       // After basket operation wait for next tick to reprocess
@@ -1569,14 +1845,13 @@ void OnTick()
                         buyStopOrders, buyStopCount, sellStopOrders, sellStopCount);
 
    // ============================================================
-   // STEP 8.5: Market Order Grid — check price-level crossings
+   // STEP 8: Market Order Grid — check price-level crossings
    // ============================================================
    ProcessMarketGridLevels();
 
    // ============================================================
-   // STEP 8: Update chart display
+   // STEP 9: Update chart display
    // ============================================================
-   // Re-read totals after potential closes
    totalProfit = CalculateTotalFloatingProfit();
    UpdateChartInfo(buyCount, sellCount, buyStopCount, sellStopCount, totalProfit, targetProfit);
 }
@@ -1588,8 +1863,13 @@ void OnDeinit(const int reason)
 {
    DestroyCloseAllButton();
    Comment("");  // Clear chart display
+   // Persist market-close state across EA restarts via global variables
+   GlobalVariableSet("GridEA_MarketCloseMode",  (double)g_marketCloseMode);
+   GlobalVariableSet("GridEA_WaitingForNewDay", (double)g_waitingForNewDay);
    Print("GridHedgeEA removed. Reason: ", reason,
-         " — positions and orders preserved for restart.");
+         " — positions and orders preserved for restart.",
+         " MarketCloseMode=", g_marketCloseMode,
+         " WaitingForNewDay=", g_waitingForNewDay);
 }
 
 //+------------------------------------------------------------------+
