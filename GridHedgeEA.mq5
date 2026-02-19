@@ -49,6 +49,17 @@ enum ENUM_MARKET_GRID_DIRECTION {
 };
 input ENUM_MARKET_GRID_DIRECTION MarketGridAboveDir = MARKET_GRID_BUY_ABOVE; // Direction above/below start
 
+//=== Order Type Enable/Disable ===
+input bool     EnableBuyStop    = true;  // Allow placing Buy Stop orders
+input bool     EnableSellStop   = true;  // Allow placing Sell Stop orders
+input bool     EnableBuyLimit   = true;  // Allow placing Buy Limit orders
+input bool     EnableSellLimit  = true;  // Allow placing Sell Limit orders
+input bool     EnableDirectBuy  = true;  // Allow placing direct Buy market orders
+input bool     EnableDirectSell = true;  // Allow placing direct Sell market orders
+
+//=== 7-Candle Range Filter ===
+input bool     EnableCandleRangeFilter = true;  // Enable 7-candle range filter for Buy entry
+
 //=== Direction Constants ===
 #define DIRECTION_UP   0
 #define DIRECTION_DOWN 1
@@ -94,6 +105,41 @@ double g_marketGridLevels[];         // Price levels above and below start
 int    g_marketGridDirections[];     // 0 = BUY, 1 = SELL for each level
 int    g_marketGridLevelCount = 0;   // Current number of active levels
 double g_marketGridStartPrice = 0.0; // The starting reference price used
+
+//=== 7-Candle Range Filter State ===
+bool g_buyEntryBlocked = false;        // True when 7-candle filter blocks Buy entry
+
+//+------------------------------------------------------------------+
+//| 7-CANDLE RANGE FILTER: Check if Buy entry is allowed             |
+//| Returns true if the most recent completed candle has the smallest |
+//| (or tied-for-smallest) range among the last 7 completed candles. |
+//+------------------------------------------------------------------+
+bool CheckBuyEntryCondition()
+{
+   if(!EnableCandleRangeFilter) return true;
+
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(_Symbol, PERIOD_CURRENT, 0, 8, rates);
+   if(copied < 8) return false; // Not enough candle data
+
+   // rates[0] = current incomplete bar
+   // rates[1] = most recent completed bar (the one we check)
+   // rates[2..7] = older completed bars
+
+   double lastRange = rates[1].high - rates[1].low;
+   double minRange  = lastRange;
+
+   for(int i = 2; i <= 7; i++)
+   {
+      double range_i = rates[i].high - rates[i].low;
+      if(range_i < minRange) minRange = range_i;
+   }
+
+   // Condition met if most recent completed candle has smallest or tied-for-smallest range
+   // Use small tolerance for floating point comparison
+   return (lastRange <= minRange + g_point * 0.1);
+}
 
 //+------------------------------------------------------------------+
 //| UTILITY: Normalize price to valid tick size multiple              |
@@ -323,6 +369,19 @@ bool PlacePendingOrder(ENUM_ORDER_TYPE orderType, double price, double lots)
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return false;
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))           return false;
    if(!TerminalInfoInteger(TERMINAL_CONNECTED))     return false;
+
+   // Check if this order type is enabled
+   if(orderType == ORDER_TYPE_BUY_STOP  && !EnableBuyStop)  return false;
+   if(orderType == ORDER_TYPE_SELL_STOP && !EnableSellStop) return false;
+   if(orderType == ORDER_TYPE_BUY_LIMIT && !EnableBuyLimit) return false;
+   if(orderType == ORDER_TYPE_SELL_LIMIT && !EnableSellLimit) return false;
+
+   // 7-Candle Range Filter: block Buy-creating pending orders when filter is active
+   if(g_buyEntryBlocked)
+   {
+      if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_BUY_LIMIT)
+         return false;
+   }
 
    price = NormalizePrice(price);
    bool result = false;
@@ -1051,14 +1110,13 @@ void ExecuteFullClose(SOrderInfo &buyPositions[], SOrderInfo &sellPositions[],
 {
    Print("=== EXECUTING FULL CLOSE === Total profit target reached.");
 
-   // === STEP 1: Calculate total lots each side ===
+   // === STEP 1: Hedge — place market order to balance total Buy and Sell exposure ===
    double totalBuyLots  = 0.0;
    double totalSellLots = 0.0;
 
    for(int i = 0; i < buyCount;  i++) totalBuyLots  += buyPositions[i].lots;
    for(int i = 0; i < sellCount; i++) totalSellLots += sellPositions[i].lots;
 
-   // === STEP 2: Hedge to neutral ===
    double diff = NormalizeDouble(MathAbs(totalBuyLots - totalSellLots), 2);
    diff = MathCeil(diff / g_lotStep) * g_lotStep;
    diff = NormalizeDouble(diff, 2);
@@ -1081,11 +1139,68 @@ void ExecuteFullClose(SOrderInfo &buyPositions[], SOrderInfo &sellPositions[],
       Sleep(500);
    }
 
-   // === STEP 3: Delete all pending orders ===
+   // === STEP 2: Delete all pending orders and verify none remain ===
+   //             (pending orders may trigger during deletion, creating new imbalance)
    DeleteAllPendingOrders();
    Sleep(500);
 
-   // === STEP 4: Close all positions via CloseBy ===
+   for(int attempt = 0; attempt < 5; attempt++)
+   {
+      int pendingCount = 0;
+      for(int i = 0; i < OrdersTotal(); i++)
+      {
+         ulong ticket = OrderGetTicket(i);
+         if(ticket == 0) continue;
+         if(OrderGetString(ORDER_SYMBOL)  != _Symbol)    continue;
+         if(OrderGetInteger(ORDER_MAGIC)  != MagicNumber) continue;
+         pendingCount++;
+      }
+      if(pendingCount == 0) break;
+      Print("ExecuteFullClose: ", pendingCount, " pending orders still exist. Retrying deletion (attempt ", attempt + 1, ")...");
+      DeleteAllPendingOrders();
+      Sleep(500);
+   }
+
+   // === STEP 3: Re-verify volume symmetry ===
+   //             Pending orders may have triggered between Step 1 and Step 2,
+   //             so re-check and rebalance until Buy volume == Sell volume.
+   for(int attempt = 0; attempt < 5; attempt++)
+   {
+      SOrderInfo freshBuys[], freshSells[];
+      CollectAndSortPositions(freshBuys, freshSells);
+
+      totalBuyLots  = 0.0;
+      totalSellLots = 0.0;
+      for(int i = 0; i < ArraySize(freshBuys);  i++) totalBuyLots  += freshBuys[i].lots;
+      for(int i = 0; i < ArraySize(freshSells); i++) totalSellLots += freshSells[i].lots;
+
+      diff = NormalizeDouble(MathAbs(totalBuyLots - totalSellLots), 2);
+      if(diff < g_lotStep)
+      {
+         Print("ExecuteFullClose: Volume symmetry confirmed. Buy=", totalBuyLots, " Sell=", totalSellLots);
+         break;
+      }
+
+      diff = MathCeil(diff / g_lotStep) * g_lotStep;
+      diff = NormalizeDouble(diff, 2);
+
+      Print("ExecuteFullClose: Volume imbalance detected (attempt ", attempt + 1,
+            "). Buy=", totalBuyLots, " Sell=", totalSellLots, " Rebalancing diff=", diff);
+
+      if(totalBuyLots > totalSellLots)
+      {
+         if(!trade.Sell(diff, _Symbol, 0, 0, 0, "Rebalance to neutral"))
+            Print("ExecuteFullClose: Rebalance Sell failed — ", trade.ResultRetcodeDescription());
+      }
+      else
+      {
+         if(!trade.Buy(diff, _Symbol, 0, 0, 0, "Rebalance to neutral"))
+            Print("ExecuteFullClose: Rebalance Buy failed — ", trade.ResultRetcodeDescription());
+      }
+      Sleep(500);
+   }
+
+   // === STEP 4: Close all positions simultaneously via CloseBy ===
    SOrderInfo allBuys[], allSells[];
    CollectAndSortPositions(allBuys, allSells);
 
@@ -1215,6 +1330,12 @@ void ProcessMarketGridLevels()
       {
          if(g_marketGridDirections[i] == 0) // BUY
          {
+            // Check if direct Buy is enabled and 7-candle filter allows it
+            if(!EnableDirectBuy || g_buyEntryBlocked)
+            {
+               // Don't remove the level — it will be re-checked next tick
+               continue;
+            }
             if(!trade.Buy(g_sessionLotSize, _Symbol, 0, 0, 0,
                           "MarketGrid BUY at " + DoubleToString(level, g_digits)))
                Print("MarketGrid BUY failed — ", trade.ResultRetcodeDescription());
@@ -1223,6 +1344,11 @@ void ProcessMarketGridLevels()
          }
          else // SELL
          {
+            // Check if direct Sell is enabled
+            if(!EnableDirectSell)
+            {
+               continue;
+            }
             if(!trade.Sell(g_sessionLotSize, _Symbol, 0, 0, 0,
                            "MarketGrid SELL at " + DoubleToString(level, g_digits)))
                Print("MarketGrid SELL failed — ", trade.ResultRetcodeDescription());
@@ -1373,6 +1499,12 @@ void UpdateChartInfo(int buyCount, int sellCount, int buyStopCount, int sellStop
    info += "   MktClose:    " + (UseMarketCloseProtection ? (g_marketCloseMode ? "ACTIVE" : "Armed (" + IntegerToString(HoursBeforeClose) + "h)") : "OFF") + "\n";
    info += "   NewDayWait:  " + (g_waitingForNewDay ? ("YES (restart at " + IntegerToString(TradingStartHour) + ":00)") : "No") + "\n";
    info += "   Connection:  " + (connected ? "OK" : "LOST") + "\n";
+   info += "----------------------------------------\n";
+   info += " ORDER TYPES\n";
+   info += "   BuyStop:  " + (EnableBuyStop ? "ON" : "OFF") + "  SellStop:  " + (EnableSellStop ? "ON" : "OFF") + "\n";
+   info += "   BuyLimit: " + (EnableBuyLimit ? "ON" : "OFF") + "  SellLimit: " + (EnableSellLimit ? "ON" : "OFF") + "\n";
+   info += "   DirectBuy:" + (EnableDirectBuy ? "ON" : "OFF") + "  DirectSell:" + (EnableDirectSell ? "ON" : "OFF") + "\n";
+   info += "   7CandleFlt: " + (EnableCandleRangeFilter ? (g_buyEntryBlocked ? "BLOCKING" : "OK") : "OFF") + "\n";
    info += "========================================\n";
 
    Comment(info);
@@ -1420,11 +1552,77 @@ void CloseAllAndExit()
 {
    Print("=== CLOSE ALL & EXIT === User requested full shutdown.");
 
-   // 1. Delete all pending orders
+   // 1. Hedge — balance total Buy and Sell exposure
+   SOrderInfo buyPos[], sellPos[];
+   CollectAndSortPositions(buyPos, sellPos);
+
+   double totalBuyLots  = 0.0;
+   double totalSellLots = 0.0;
+   for(int i = 0; i < ArraySize(buyPos);  i++) totalBuyLots  += buyPos[i].lots;
+   for(int i = 0; i < ArraySize(sellPos); i++) totalSellLots += sellPos[i].lots;
+
+   double diff = NormalizeDouble(MathAbs(totalBuyLots - totalSellLots), 2);
+   diff = MathCeil(diff / g_lotStep) * g_lotStep;
+   diff = NormalizeDouble(diff, 2);
+
+   if(diff > 0.0)
+   {
+      if(totalBuyLots > totalSellLots)
+         trade.Sell(diff, _Symbol, 0, 0, 0, "Exit hedge to neutral");
+      else if(totalSellLots > totalBuyLots)
+         trade.Buy(diff, _Symbol, 0, 0, 0, "Exit hedge to neutral");
+      Sleep(500);
+   }
+
+   // 2. Delete all pending orders and verify none remain
    DeleteAllPendingOrders();
    Sleep(500);
 
-   // 2. Close via CloseBy where possible (saves spread)
+   for(int attempt = 0; attempt < 5; attempt++)
+   {
+      int pendingCount = 0;
+      for(int i = 0; i < OrdersTotal(); i++)
+      {
+         ulong ticket = OrderGetTicket(i);
+         if(ticket == 0) continue;
+         if(OrderGetString(ORDER_SYMBOL)  != _Symbol)    continue;
+         if(OrderGetInteger(ORDER_MAGIC)  != MagicNumber) continue;
+         pendingCount++;
+      }
+      if(pendingCount == 0) break;
+      Print("CloseAllAndExit: ", pendingCount, " pending orders still exist. Retrying...");
+      DeleteAllPendingOrders();
+      Sleep(500);
+   }
+
+   // 3. Re-verify volume symmetry and rebalance if needed
+   for(int attempt = 0; attempt < 5; attempt++)
+   {
+      SOrderInfo freshBuys[], freshSells[];
+      CollectAndSortPositions(freshBuys, freshSells);
+
+      totalBuyLots  = 0.0;
+      totalSellLots = 0.0;
+      for(int i = 0; i < ArraySize(freshBuys);  i++) totalBuyLots  += freshBuys[i].lots;
+      for(int i = 0; i < ArraySize(freshSells); i++) totalSellLots += freshSells[i].lots;
+
+      diff = NormalizeDouble(MathAbs(totalBuyLots - totalSellLots), 2);
+      if(diff < g_lotStep) break;
+
+      diff = MathCeil(diff / g_lotStep) * g_lotStep;
+      diff = NormalizeDouble(diff, 2);
+
+      Print("CloseAllAndExit: Volume imbalance (attempt ", attempt + 1,
+            "). Buy=", totalBuyLots, " Sell=", totalSellLots, " Rebalancing diff=", diff);
+
+      if(totalBuyLots > totalSellLots)
+         trade.Sell(diff, _Symbol, 0, 0, 0, "Exit rebalance");
+      else
+         trade.Buy(diff, _Symbol, 0, 0, 0, "Exit rebalance");
+      Sleep(500);
+   }
+
+   // 4. Close via CloseBy where possible (saves spread)
    SOrderInfo allBuys[], allSells[];
    CollectAndSortPositions(allBuys, allSells);
    int pairs = MathMin(ArraySize(allBuys), ArraySize(allSells));
@@ -1434,17 +1632,17 @@ void CloseAllAndExit()
       Sleep(200);
    }
 
-   // 3. Close any remaining positions normally
+   // 5. Close any remaining positions normally
    CloseAllRemainingPositions();
 
-   // 4. Reset EA state
+   // 6. Reset EA state
    g_gridInitialized = false;
    g_anchorPrice     = 0.0;
    g_sessionLotSize  = 0.0;
 
    Print("=== ALL CLOSED === EA shutdown complete.");
 
-   // 5. Remove EA from chart
+   // 7. Remove EA from chart
    ExpertRemove();
 }
 
@@ -1737,6 +1935,17 @@ void OnTick()
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // ============================================================
+   // 7-Candle Range Filter: block Buy entry when no Buy positions
+   // and the most recent candle is NOT the smallest range
+   // ============================================================
+   g_buyEntryBlocked = false;
+   if(EnableCandleRangeFilter && buyCount == 0)
+   {
+      if(!CheckBuyEntryCondition())
+         g_buyEntryBlocked = true;
+   }
 
    // ============================================================
    // STEP 1: Activate market close protection if time has come
